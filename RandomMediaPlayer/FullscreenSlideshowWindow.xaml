@@ -1,0 +1,19 @@
+<Window x:Class="RandomMediaPlayer.FullscreenSlideshowWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:Vlc="clr-namespace:Vlc.DotNet.Wpf;assembly=Vlc.DotNet.Wpf"
+        Title="Fullscreen Slideshow" WindowStyle="None" Background="Black"
+        ThemeMode="Dark"
+        KeyDown="Window_KeyDown">
+    <Grid>
+        <Image x:Name="FullscreenImage" Stretch="Uniform"
+               HorizontalAlignment="Center" VerticalAlignment="Center"
+               Visibility="Collapsed"/>
+        <Vlc:VlcControl x:Name="VlcCanvas" Visibility="Collapsed"/>
+        <MediaElement x:Name="GifPlayer"
+                      LoadedBehavior="Manual"
+                      UnloadedBehavior="Stop"
+                      Stretch="Uniform"
+                      Visibility="Collapsed"/>
+    </Grid>
+</Window>

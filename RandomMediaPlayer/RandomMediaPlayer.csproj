@@ -1,0 +1,79 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationIcon>photo-album-icon-png-3.ico</ApplicationIcon>
+    <PackageIcon>photo-album-icon-png-3.jpg</PackageIcon>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>RandomMediaPlayer</AssemblyName>
+    <RootNamespace>RandomMediaPlayer</RootNamespace>
+    <!-- Tell Vlc.DotNet where to drop the native binaries -->
+    <VlcLibDirectory>$(OutputPath)libvlc</VlcLibDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="photo-album-icon-png-3.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MediaInfo.Wrapper.Core" Version="26.1.0" />
+    <PackageReference Include="Ookii.Dialogs.Wpf" Version="5.0.1" />
+    <PackageReference Include="Vlc.DotNet.Wpf" Version="3.1.0" />
+    <PackageReference Include="WpfScreenHelper" Version="2.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="photo-album-icon-png-3.jpg" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="photo-album-icon-png-3.jpg">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <!--
+    Vlc.DotNet's MSBuild targets don't fire on .NET 9.
+    This target copies the native libvlc binaries from the NuGet package cache
+    into the output directory after every build so the app can find them at runtime.
+  -->
+  <Target Name="CopyVlcNativeBinaries" AfterTargets="Build">
+    <PropertyGroup>
+      <_VlcArch>win-x64</_VlcArch>
+      <_VlcDest>$(OutputPath)libvlc\$(_VlcArch)\</_VlcDest>
+
+      <!-- NuGet cache - try MSBuild-provided root first, then the user-profile default -->
+      <_VlcPkgBuild>$(NuGetPackageRoot)vlc.dotnet.wpf\3.1.0\build\x64</_VlcPkgBuild>
+      <_VlcPkgBuild Condition="!Exists('$(_VlcPkgBuild)')">$(USERPROFILE)\.nuget\packages\vlc.dotnet.wpf\3.1.0\build\x64</_VlcPkgBuild>
+
+      <!-- Pick whichever source exists -->
+      <_VlcSrc Condition="Exists('$(_VlcPkgBuild)')">$(_VlcPkgBuild)</_VlcSrc>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <_VlcFiles Include="$(_VlcSrc)\**\*.*" Condition="'$(_VlcSrc)' != ''" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_VlcFiles)"
+          DestinationFiles="@(_VlcFiles->'$(_VlcDest)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'$(_VlcSrc)' != ''" />
+
+    <Message Text="[VLC] Copied libvlc native binaries from '$(_VlcSrc)' to '$(_VlcDest)'"
+             Importance="high"
+             Condition="'$(_VlcSrc)' != ''" />
+
+    <!-- Not finding bundled libvlc is expected: at runtime the app falls back to
+         the system VLC install (Program Files\VideoLAN\VLC). Logged at low
+         importance only. -->
+    <Message Text="[VLC] No bundled libvlc found in NuGet cache. App will use system VLC install at runtime."
+             Importance="low"
+             Condition="'$(_VlcSrc)' == ''" />
+  </Target>
+
+</Project>
