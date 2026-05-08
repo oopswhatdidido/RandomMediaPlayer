@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Windows;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -11,6 +13,9 @@ namespace RandomMediaPlayer
     {
         private bool _vlcReady;
         private MainWindow? _ownerMain;
+        // Tracked separately from the hyperlink text so the click handler
+        // gets a canonical path even if the visible string is truncated.
+        private string? _currentOverlayPath;
 
         public FullscreenSlideshowWindow(MainWindow? ownerMain = null)
         {
@@ -130,6 +135,36 @@ namespace RandomMediaPlayer
             // Forward Space / Del / Left / Right to the main window so the
             // user gets identical key behavior in both views.
             _ownerMain?.HandleHotKey(e);
+        }
+
+        // Updates the bottom-edge clickable file-path overlay on this window.
+        // Pass show=false (or path=null) to hide the overlay entirely.
+        public void SetPathOverlay(string? path, bool show)
+        {
+            if (!show || string.IsNullOrEmpty(path))
+            {
+                PathOverlayBorder.Visibility = Visibility.Collapsed;
+                _currentOverlayPath = null;
+                return;
+            }
+            _currentOverlayPath = path;
+            PathOverlayHyperlink.Inlines.Clear();
+            PathOverlayHyperlink.Inlines.Add(new Run(path));
+            PathOverlayBorder.Visibility = Visibility.Visible;
+        }
+
+        private void PathOverlayHyperlink_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(_currentOverlayPath)) return;
+            if (!File.Exists(_currentOverlayPath)) return;
+            try
+            {
+                Process.Start("explorer.exe", $"/select,\"{_currentOverlayPath}\"");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Overlay] Open file location failed: {ex.Message}");
+            }
         }
     }
 }

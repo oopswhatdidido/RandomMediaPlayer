@@ -3,7 +3,6 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:Vlc="clr-namespace:Vlc.DotNet.Wpf;assembly=Vlc.DotNet.Wpf"
         Title="Fullscreen Slideshow" WindowStyle="None" Background="Black"
-        ThemeMode="Dark"
         KeyDown="Window_KeyDown">
     <Grid>
         <Image x:Name="FullscreenImage" Stretch="Uniform"
@@ -15,5 +14,24 @@
                       UnloadedBehavior="Stop"
                       Stretch="Uniform"
                       Visibility="Collapsed"/>
+
+        <!-- Path overlay (clickable). Last in the Grid so it z-orders on top.
+             Vlc.DotNet.Wpf renders via D3DImage (not HwndHost), so a regular
+             WPF child sits cleanly above the video without airspace issues. -->
+        <Border x:Name="PathOverlayBorder"
+                VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
+                Background="#B0000000"
+                Padding="14,8"
+                Visibility="Collapsed">
+            <TextBlock x:Name="PathOverlayText"
+                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="NoWrap"
+                       FontSize="13"
+                       Foreground="#FFEEEEEE">
+                <Hyperlink x:Name="PathOverlayHyperlink"
+                           Click="PathOverlayHyperlink_Click"
+                           Foreground="#FF7B9FFF"/>
+            </TextBlock>
+        </Border>
     </Grid>
 </Window>

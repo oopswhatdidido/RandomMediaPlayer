@@ -11,6 +11,9 @@
     <PlatformTarget>x64</PlatformTarget>
     <AssemblyName>RandomMediaPlayer</AssemblyName>
     <RootNamespace>RandomMediaPlayer</RootNamespace>
+    <!-- WPF0001 = "Application.ThemeMode is for evaluation purposes only".
+         We use it intentionally for the runtime Light/Dark/System toggle. -->
+    <NoWarn>$(NoWarn);WPF0001</NoWarn>
     <!-- Tell Vlc.DotNet where to drop the native binaries -->
     <VlcLibDirectory>$(OutputPath)libvlc</VlcLibDirectory>
   </PropertyGroup>

@@ -27,7 +27,23 @@ namespace RandomMediaPlayer
         public bool AlwaysOnTop { get; set; }
         public bool ScaleToFill { get; set; }
         public bool Mute { get; set; } = true;
-        // Empty string = "None / preview only".
+        // When true, each fullscreen window paints a clickable file-path
+        // strip along its bottom edge (mirrors the hyperlink in the main
+        // control window).
+        public bool ShowPathOverlay { get; set; }
+
+        // App theme: "Light", "Dark", or "System". Drives Application.ThemeMode
+        // and round-trips between runs.
+        public string Theme { get; set; } = "Dark";
+
+        // Multi-monitor configuration. Empty list = no fullscreen, preview-only.
+        public List<MonitorConfig> Monitors { get; set; } = new();
+        // false = sync (one pick shown on all selected monitors)
+        // true  = each selected monitor picks independently
+        public bool IndependentMonitors { get; set; }
+
+        // Legacy single-monitor field, kept for one-version backward compat
+        // when reading old settings files. New code uses the Monitors list.
         public string MonitorDeviceName { get; set; } = "";
 
         // Panic hotkey (global)
@@ -50,6 +66,13 @@ namespace RandomMediaPlayer
         // Folder persistence
         public bool PersistFolders { get; set; }
         public List<string> Folders { get; set; } = new();
+
+        public class MonitorConfig
+        {
+            public string DeviceName { get; set; } = "";
+            public bool Selected { get; set; }
+            public string Orientation { get; set; } = "All";
+        }
 
         private static string SettingsDir =>
             Path.Combine(

@@ -79,7 +79,14 @@ namespace RandomMediaPlayer
         private DispatcherTimer _slideshowTimer = null!;
         private readonly Random _random = new();
         private Screen[] _monitors = Array.Empty<Screen>();
-        private FullscreenSlideshowWindow? _fullscreenWindow;
+
+        // Per-monitor configuration + runtime state. UI-bound, persisted.
+        private List<MonitorContext> _monitorContexts = new();
+
+        // Mode: false = sync (one pick shown on every selected monitor),
+        // true = independent (each selected monitor picks its own using its
+        // OrientationFilter).
+        private bool _independentMonitors;
 
         private string? _currentMediaPath;
         private MediaKind _currentMediaKind = MediaKind.Image;
@@ -193,6 +200,11 @@ namespace RandomMediaPlayer
         // back. Capped to MaxHistory.
         private readonly List<string> _history = new();
         private const int MaxHistory = 5;
+
+        // Cancels the in-flight enumeration when the user fires another one
+        // (e.g., switching modes mid-scan). Without this, two enumerations
+        // race on the same progress bar and produce visible flicker.
+        private System.Threading.CancellationTokenSource? _enumerationCts;
 
         public MainWindow()
         {
@@ -760,13 +772,19 @@ namespace RandomMediaPlayer
             SetThreadExecutionState(EXECUTION_STATE.ES_CONTINUOUS);
 
         // ---------- Mode + UI wiring ----------
-        private void OnModeChanged(object sender, RoutedEventArgs e)
+        // The mode picker is a header-only TabControl (Photos / Videos / Mixed).
+        // SelectionChanged fires once during XAML init when index 0 latches in,
+        // hence the _uiInitialized gate before kicking off any side effects.
+        private void OnModeTabChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (PhotoModeRadio == null) return;
+            if (ModeTabControl == null) return;
 
-            if (VideoModeRadio?.IsChecked == true) _mode = MediaMode.Video;
-            else if (MixedModeRadio?.IsChecked == true) _mode = MediaMode.Mixed;
-            else _mode = MediaMode.Photo;
+            _mode = ModeTabControl.SelectedIndex switch
+            {
+                1 => MediaMode.Video,
+                2 => MediaMode.Mixed,
+                _ => MediaMode.Photo,
+            };
 
             ApplyModeUi();
 
@@ -780,27 +798,27 @@ namespace RandomMediaPlayer
         }
 
         // Pure UI update - no value mutation, so loading settings doesn't get
-        // its DelayTextBox value overwritten.
+        // its DelayTextBox value overwritten. Mute / min-size live in the
+        // Filters tab and are always visible (their relevance changes with
+        // mode but the controls themselves don't move).
         private void ApplyModeUi()
         {
-            if (VideoOptionsRow == null) return;
+            // DelayLabel can be null briefly during XAML init; guard for that.
+            if (DelayLabel == null) return;
 
             switch (_mode)
             {
                 case MediaMode.Photo:
-                    VideoOptionsRow.Visibility = Visibility.Collapsed;
                     Title = "Random Media Player - Photos";
                     DelayLabel.Text = "Display time (s):";
                     break;
 
                 case MediaMode.Video:
-                    VideoOptionsRow.Visibility = Visibility.Visible;
                     Title = "Random Media Player - Videos";
                     DelayLabel.Text = "Clip length (s):";
                     break;
 
                 case MediaMode.Mixed:
-                    VideoOptionsRow.Visibility = Visibility.Visible;
                     Title = "Random Media Player - Mixed";
                     DelayLabel.Text = "Default time (s):";
                     break;
@@ -819,8 +837,40 @@ namespace RandomMediaPlayer
         private void AlwaysOnTopCheckBox_Changed(object sender, RoutedEventArgs e)
         {
             this.Topmost = AlwaysOnTopCheckBox.IsChecked == true;
-            if (_fullscreenWindow != null)
-                _fullscreenWindow.Topmost = this.Topmost;
+            // Mirror to every open monitor window so they all stay on top together.
+            foreach (var ctx in _monitorContexts.Where(c => c.Window != null))
+                ctx.Window!.Topmost = this.Topmost;
+        }
+
+        // Push the new overlay state into every currently-open monitor window
+        // immediately, so the toggle takes visible effect without waiting for
+        // the next advance.
+        private void ShowPathOverlayCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!_uiInitialized) return;
+            bool show = ShowPathOverlayCheckBox.IsChecked == true;
+            foreach (var ctx in _monitorContexts.Where(c => c.Window != null))
+                ctx.Window!.SetPathOverlay(ctx.CurrentPath ?? _currentMediaPath, show);
+        }
+
+        // Drives Application.ThemeMode at runtime. .NET 9 propagates the
+        // change to every open Window, so the main window and any open
+        // fullscreen windows re-theme immediately.
+        private void ThemeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_uiInitialized) return;
+            ApplyThemeFromCombo();
+        }
+
+        private void ApplyThemeFromCombo()
+        {
+            string label = (ThemeComboBox.SelectedItem as ComboBoxItem)?.Content as string ?? "Dark";
+            Application.Current.ThemeMode = label switch
+            {
+                "Light"  => ThemeMode.Light,
+                "System" => ThemeMode.System,
+                _        => ThemeMode.Dark,
+            };
         }
 
         private void IncludeAnimatedCheckBox_Changed(object sender, RoutedEventArgs e)
@@ -848,35 +898,121 @@ namespace RandomMediaPlayer
         }
 
         // ---------- Monitors ----------
-        // Sentinel as the first item; selecting it skips opening a fullscreen window
-        // and keeps playback inside the main window's preview area only.
-        private const string NoneMonitorLabel = "None  -  preview only";
-
         private void LoadMonitors()
         {
             _monitors = Screen.AllScreens.ToArray();
-            var items = new List<string> { NoneMonitorLabel };
-            items.AddRange(_monitors.Select(m => m.DeviceName));
-            MonitorComboBox.ItemsSource = items;
-            // Default to None - user can pick a monitor explicitly.
-            MonitorComboBox.SelectedIndex = 0;
+            _monitorContexts = _monitors
+                .Select((s, i) => new MonitorContext(i, s))
+                .ToList();
+            MonitorsItemsControl.ItemsSource = _monitorContexts;
         }
 
-        private bool IsNoneMonitorSelected() =>
-            MonitorComboBox.SelectedIndex <= 0;
+        // Open / close the fullscreen window per monitor based on its Selected
+        // flag. Returns the list of newly-opened contexts so the caller can
+        // immediately push current media into them (avoids a blank window
+        // until the next advance).
+        private List<MonitorContext> SyncMonitorWindows()
+        {
+            var newlyOpened = new List<MonitorContext>();
+            foreach (var ctx in _monitorContexts)
+            {
+                if (ctx.Selected && ctx.Window == null)
+                {
+                    var mon = ctx.Screen;
+                    var win = new FullscreenSlideshowWindow(this)
+                    {
+                        WindowStartupLocation = WindowStartupLocation.Manual,
+                        Left = mon.WpfWorkingArea.Left,
+                        Top = mon.WpfWorkingArea.Top,
+                        Width = mon.WpfWorkingArea.Width,
+                        Height = mon.WpfWorkingArea.Height,
+                        Topmost = AlwaysOnTopCheckBox.IsChecked == true
+                    };
+                    var capturedCtx = ctx;
+                    win.Closed += (s, e) => { capturedCtx.Window = null; };
+                    win.Show();
+                    win.WindowState = WindowState.Maximized;
+                    ctx.Window = win;
+                    newlyOpened.Add(ctx);
+                }
+                else if (!ctx.Selected && ctx.Window != null)
+                {
+                    ctx.Window.Close();
+                    ctx.Window = null;
+                    // Drop runtime state so a re-tick on this context is fresh.
+                    ctx.CurrentPath = null;
+                    ctx.NextPath = null;
+                    ctx.NextImage = null;
+                    ctx.History.Clear();
+                }
+            }
+            return newlyOpened;
+        }
 
-        private int GetSelectedMonitorIndex() =>
-            MonitorComboBox.SelectedIndex - 1; // -1 means None
+        private void CloseAllMonitorWindows()
+        {
+            foreach (var ctx in _monitorContexts)
+            {
+                if (ctx.Window != null)
+                {
+                    try { ctx.Window.Close(); } catch { }
+                    ctx.Window = null;
+                }
+                ctx.CurrentPath = null;
+                ctx.NextPath = null;
+                ctx.NextImage = null;
+                ctx.IsAdvancing = false;
+                ctx.IsPreloading = false;
+                ctx.History.Clear();
+            }
+        }
 
-        // When the user picks "None" mid-show, close any open fullscreen so it
-        // doesn't keep playing on the previously chosen monitor.
-        private void MonitorComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        private bool AnyMonitorSelected() => _monitorContexts.Any(c => c.Selected);
+
+        private void OnMonitorModeChanged(object sender, RoutedEventArgs e)
         {
             if (!_uiInitialized) return;
-            if (IsNoneMonitorSelected() && _fullscreenWindow != null)
+            _independentMonitors = IndependentMonitorsRadio.IsChecked == true;
+        }
+
+        private void MonitorSelectedChanged(object sender, RoutedEventArgs e)
+        {
+            if (!_uiInitialized) return;
+            // Two-way binding has already updated MonitorContext.Selected.
+            // Don't open / close fullscreen windows during configuration -
+            // they'd cover the control window before the user is ready.
+            // StartSlideshow() opens all selected windows when the user
+            // actually starts the show; while running, toggling a monitor
+            // here opens / closes its window immediately so the change is
+            // live.
+            if (!_isSlideshowRunning) return;
+
+            var newlyOpened = SyncMonitorWindows();
+            foreach (var ctx in newlyOpened)
+                PushCurrentToContext(ctx);
+        }
+
+        // When a monitor is checked mid-show, immediately push the current
+        // global media into it (sync mode) or kick off its own preload+advance
+        // (independent mode).
+        private async void PushCurrentToContext(MonitorContext ctx)
+        {
+            try
             {
-                _fullscreenWindow.Close();
-                _fullscreenWindow = null;
+                if (_independentMonitors)
+                {
+                    // Independent: this context picks its own.
+                    await AdvanceContextAsync(ctx);
+                }
+                else if (!string.IsNullOrEmpty(_currentMediaPath) && ctx.Window != null)
+                {
+                    // Sync: push the current global pick.
+                    await ShowOnContextAsync(ctx, _currentMediaPath!, _nextImageBuffer, _currentMediaKind);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Monitor] PushCurrentToContext failed: {ex.Message}");
             }
         }
 
@@ -984,6 +1120,13 @@ namespace RandomMediaPlayer
 
         private async Task RefreshMediaListAsync()
         {
+            // Cancel any enumeration that's still in flight (e.g., user just
+            // switched modes mid-scan) so we don't race two scans on the same
+            // progress bar.
+            _enumerationCts?.Cancel();
+            _enumerationCts = new System.Threading.CancellationTokenSource();
+            var ct = _enumerationCts.Token;
+
             RefreshButton.IsEnabled = false;
             StartShowButton.IsEnabled = false;
             FileEnumerationProgressBar.Value = 0;
@@ -1000,22 +1143,34 @@ namespace RandomMediaPlayer
             var extensions = GetActiveExtensions();
             var progress = new Progress<(int percentage, int matched, int scanned)>(p =>
             {
+                // Drop progress reports from a cancelled run - stops the bar
+                // flicker when a newer scan has already started.
+                if (ct.IsCancellationRequested) return;
                 FileEnumerationProgressBar.Value = p.percentage;
                 ProgressLabel.Content = $"Matched {p.matched} of {p.scanned} files ({p.percentage}%)";
             });
 
+            var collected = new List<string>();
             try
             {
                 _mediaFiles.Clear();
                 _nextImageBuffer = null;
                 _nextMediaPath = null;
 
-                var collected = new List<string>();
-                await Task.Run(() => EnumerateMultipleFolders(_selectedFolders, extensions, collected, progress));
+                await Task.Run(() => EnumerateMultipleFolders(_selectedFolders, extensions, collected, progress, ct), ct);
+
+                // Don't commit results from a cancelled scan - the new scan
+                // will overwrite anyway.
+                if (ct.IsCancellationRequested) return;
 
                 // Bulk-append on the UI thread once enumeration is done.
                 foreach (var f in collected)
                     _mediaFiles.Add(f);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on cancellation; stay quiet.
+                return;
             }
             catch (Exception ex)
             {
@@ -1023,17 +1178,22 @@ namespace RandomMediaPlayer
             }
             finally
             {
-                RefreshButton.IsEnabled = true;
-                StartShowButton.IsEnabled = true;
-                ProgressLabel.Content = _totalScannedFiles > 0
-                    ? $"Done. Found {_mediaFiles.Count} of {_totalScannedFiles} files scanned."
-                    : $"Done. Found {_mediaFiles.Count} items.";
-                FileEnumerationProgressBar.Value = 100;
+                // Only update final UI state if we weren't cancelled by a newer
+                // scan - otherwise the newer scan owns the UI now.
+                if (!ct.IsCancellationRequested)
+                {
+                    RefreshButton.IsEnabled = true;
+                    StartShowButton.IsEnabled = true;
+                    ProgressLabel.Content = _totalScannedFiles > 0
+                        ? $"Done. Found {_mediaFiles.Count} of {_totalScannedFiles} files scanned."
+                        : $"Done. Found {_mediaFiles.Count} items.";
+                    FileEnumerationProgressBar.Value = 100;
 
-                if (_mediaFiles.Count == 0)
-                    MessageBox.Show("No media found in the selected folders.");
-                else
-                    await PreloadNextAsync();
+                    if (_mediaFiles.Count == 0)
+                        MessageBox.Show("No media found in the selected folders.");
+                    else
+                        await PreloadNextAsync();
+                }
             }
         }
 
@@ -1043,7 +1203,8 @@ namespace RandomMediaPlayer
 
         private void EnumerateMultipleFolders(List<string> folders, string[] extensions,
                                               List<string> output,
-                                              IProgress<(int, int, int)> progress)
+                                              IProgress<(int, int, int)> progress,
+                                              System.Threading.CancellationToken ct)
         {
             var extSet = new HashSet<string>(extensions, StringComparer.OrdinalIgnoreCase);
             int folderCount = folders.Count(Directory.Exists);
@@ -1052,19 +1213,24 @@ namespace RandomMediaPlayer
 
             foreach (var folder in folders.Where(Directory.Exists))
             {
-                EnumerateOneFolder(folder, extSet, output, processedFolders, folderCount, progress);
+                if (ct.IsCancellationRequested) return;
+
+                EnumerateOneFolder(folder, extSet, output, processedFolders, folderCount, progress, ct);
                 processedFolders++;
                 int pct = folderCount > 0 ? (int)((double)processedFolders / folderCount * 100) : 100;
                 progress.Report((Math.Min(pct, 99), output.Count, _totalScannedFiles));
             }
+            if (ct.IsCancellationRequested) return;
             progress.Report((100, output.Count, _totalScannedFiles));
             Debug.WriteLine($"[Enumerate] Done. Matched {output.Count} of {_totalScannedFiles} files scanned across {folderCount} root folder(s). Active extensions: {string.Join(", ", extensions)}");
         }
 
         private void EnumerateOneFolder(string path, HashSet<string> extSet, List<string> output,
                                         int foldersDone, int totalFolders,
-                                        IProgress<(int, int, int)> progress)
+                                        IProgress<(int, int, int)> progress,
+                                        System.Threading.CancellationToken ct)
         {
+            if (ct.IsCancellationRequested) return;
             // Eagerly grab the file list with its own guard so a single bad file
             // doesn't kill enumeration of its siblings or its sister directories.
             string[] files;
@@ -1080,6 +1246,9 @@ namespace RandomMediaPlayer
             int matchedHere = 0;
             foreach (var file in files)
             {
+                // Bail out fast if the user kicked off a different scan.
+                if (ct.IsCancellationRequested) return;
+
                 _totalScannedFiles++;
                 try
                 {
@@ -1114,9 +1283,10 @@ namespace RandomMediaPlayer
 
             foreach (var dir in dirs)
             {
+                if (ct.IsCancellationRequested) return;
                 try
                 {
-                    EnumerateOneFolder(dir, extSet, output, foldersDone, totalFolders, progress);
+                    EnumerateOneFolder(dir, extSet, output, foldersDone, totalFolders, progress, ct);
                 }
                 catch (Exception ex)
                 {
@@ -1170,6 +1340,12 @@ namespace RandomMediaPlayer
             PreventSleep();
             PreviewPlaceholder.Visibility = Visibility.Collapsed;
 
+            // Open the fullscreen window for every currently-selected monitor.
+            // (We deliberately do NOT do this when the user merely checks the
+            // monitor box - only here, so the control window stays usable
+            // during configuration.)
+            SyncMonitorWindows();
+
             // Trigger first advance immediately
             AdvanceToNextMedia();
             _slideshowTimer.Start();
@@ -1196,11 +1372,8 @@ namespace RandomMediaPlayer
 
             try { GifPlayer.Stop(); } catch { }
 
-            if (_fullscreenWindow != null)
-            {
-                _fullscreenWindow.Close();
-                _fullscreenWindow = null;
-            }
+            // Close every monitor's fullscreen window and clear runtime state.
+            CloseAllMonitorWindows();
         }
 
         private void UpdateStartButtonText()
@@ -1217,22 +1390,50 @@ namespace RandomMediaPlayer
         private void SlideshowTimer_Tick(object? sender, EventArgs e) => AdvanceToNextMedia();
 
         // Timer-driven advance. Honors hold (no-op) and the in-flight guard.
+        // Branches on monitor mode: sync uses one global pick everywhere,
+        // independent advances each selected monitor with its own pick.
         private async void AdvanceToNextMedia()
         {
             if (_isAdvancing || !_isSlideshowRunning || _isOnHold) return;
-            if (string.IsNullOrEmpty(_nextMediaPath)) { await PreloadNextAsync(); return; }
 
             _isAdvancing = true;
             _slideshowTimer.Stop();
 
             try
             {
-                if (_currentMediaPath != null) PushHistory(_currentMediaPath);
+                bool useIndependent = _independentMonitors && AnyMonitorSelected();
 
-                var path = _nextMediaPath!;
-                await ShowMediaAsync(path, _nextImageBuffer);
+                if (useIndependent)
+                {
+                    // Advance each selected monitor independently.
+                    var selected = _monitorContexts.Where(c => c.Selected && c.Window != null).ToList();
+                    var tasks = selected.Select(AdvanceContextAsync).ToArray();
+                    await Task.WhenAll(tasks);
 
-                await PreloadNextAsync();
+                    // Mirror the first selected monitor's media in the main
+                    // preview pane so the user can see something.
+                    var first = selected.FirstOrDefault();
+                    if (first?.CurrentPath != null)
+                    {
+                        await UpdateMainPreviewFromContextAsync(first);
+                        UpdateFilePathDisplay(first.CurrentPath);
+                        _currentMediaPath = first.CurrentPath;
+                        _currentMediaKind = first.CurrentKind;
+                    }
+                }
+                else
+                {
+                    // Sync mode (or no monitors selected): one global pick.
+                    if (string.IsNullOrEmpty(_nextMediaPath)) await PreloadNextAsync();
+                    if (string.IsNullOrEmpty(_nextMediaPath)) return;
+
+                    if (_currentMediaPath != null) PushHistory(_currentMediaPath);
+
+                    var path = _nextMediaPath!;
+                    await ShowMediaAsync(path, _nextImageBuffer);
+
+                    await PreloadNextAsync();
+                }
             }
             catch (Exception ex)
             {
@@ -1243,6 +1444,114 @@ namespace RandomMediaPlayer
                 _isAdvancing = false;
                 // Honor hold: don't restart the timer if user is holding.
                 if (_isSlideshowRunning && !_isOnHold) _slideshowTimer.Start();
+            }
+        }
+
+        // Independent-mode advance for one monitor context. Used by both the
+        // timer tick (each selected monitor advances simultaneously) and the
+        // right-arrow / NextRandomAsync flow.
+        private async Task AdvanceContextAsync(MonitorContext ctx)
+        {
+            if (ctx.IsAdvancing || ctx.Window == null) return;
+            ctx.IsAdvancing = true;
+            try
+            {
+                if (string.IsNullOrEmpty(ctx.NextPath))
+                    await PreloadForContextAsync(ctx);
+                if (string.IsNullOrEmpty(ctx.NextPath)) return;
+
+                // Push the OLD current onto this context's own history before
+                // ShowOnContextAsync overwrites CurrentPath. Per-context history
+                // means left-arrow steps each monitor back through its own
+                // sequence, not a single global one.
+                if (ctx.CurrentPath != null) PushContextHistory(ctx, ctx.CurrentPath);
+
+                var path = ctx.NextPath!;
+                var kind = ClassifyMedia(path);
+
+                await ShowOnContextAsync(ctx, path, ctx.NextImage, kind);
+
+                // Preload the next candidate for this context so timer-driven
+                // advances stay smooth.
+                await PreloadForContextAsync(ctx);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[{ctx.Screen.DeviceName}] AdvanceContextAsync failed: {ex.Message}");
+            }
+            finally
+            {
+                ctx.IsAdvancing = false;
+            }
+        }
+
+        private void PushContextHistory(MonitorContext ctx, string path)
+        {
+            if (ctx.History.Count > 0 && ctx.History[^1] == path) return;
+            ctx.History.Add(path);
+            while (ctx.History.Count > MaxHistory) ctx.History.RemoveAt(0);
+        }
+
+        // In independent mode the main preview pane mirrors whatever the first
+        // selected monitor is showing so the user has a visual reference.
+        private async Task UpdateMainPreviewFromContextAsync(MonitorContext ctx)
+        {
+            if (ctx.CurrentPath == null) return;
+            string path = ctx.CurrentPath;
+            MediaKind kind = ctx.CurrentKind;
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                StopPreviewOfOtherKinds(kind);
+                bool scaleToFill = ScaleToFillCheckBox.IsChecked == true;
+
+                if (kind == MediaKind.Image)
+                {
+                    var bmp = ctx.NextImage; // may be null if already advanced
+                    if (bmp == null)
+                    {
+                        var loaded = TryLoadBitmap(path);
+                        if (loaded == null) return;
+                        bmp = ApplyRotationIfNeeded(loaded, path);
+                    }
+                    ShowOnly(PreviewImage);
+                    PreviewImage.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
+                    PreviewImage.Source = bmp;
+                }
+                else if (kind == MediaKind.Gif)
+                {
+                    ShowOnly(GifPlayer);
+                    GifPlayer.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
+                    GifPlayer.Source = new Uri(path, UriKind.Absolute);
+                    GifPlayer.Play();
+                }
+                else // Video
+                {
+                    if (!_vlcInitialized) return;
+                    ShowOnly(VlcCanvas);
+                    var mp = VlcCanvas.SourceProvider.MediaPlayer;
+                    mp.Audio.Volume = MuteCheckBox.IsChecked == true ? 0 : 100;
+                    mp.Play(new Uri(path));
+                }
+            });
+        }
+
+        // Like StopPlaybackOfOtherKinds but only touches the main window's
+        // own preview elements (not monitor windows).
+        private void StopPreviewOfOtherKinds(MediaKind incoming)
+        {
+            if (incoming != MediaKind.Video)
+            {
+                try
+                {
+                    if (_vlcInitialized && VlcCanvas.SourceProvider.MediaPlayer != null)
+                        VlcCanvas.SourceProvider.MediaPlayer.Pause();
+                }
+                catch { }
+            }
+            if (incoming != MediaKind.Gif)
+            {
+                try { GifPlayer.Stop(); GifPlayer.Source = null; } catch { }
             }
         }
 
@@ -1276,31 +1585,58 @@ namespace RandomMediaPlayer
             while (_history.Count > MaxHistory) _history.RemoveAt(0);
         }
 
-        // User-initiated forward: bypass any preloaded buffer, pick fresh random.
-        // Called from right-arrow.
+        // User-initiated forward (right-arrow). Branches on monitor mode:
+        // sync = one global pick shown everywhere; independent = each selected
+        // monitor advances to its own next random pick.
         public async Task NextRandomAsync()
         {
             if (_isAdvancing) return;
             if (_mediaFiles.Count == 0) return;
 
+            bool useIndependent = _independentMonitors && AnyMonitorSelected();
+
             _isAdvancing = true;
             _slideshowTimer.Stop();
             try
             {
-                if (_currentMediaPath != null) PushHistory(_currentMediaPath);
+                if (useIndependent)
+                {
+                    var selected = _monitorContexts
+                        .Where(c => c.Selected && c.Window != null)
+                        .ToList();
+                    if (selected.Count == 0) return;
 
-                // If we had a preload that hasn't been used yet, use it; otherwise
-                // freshly preload one synchronously.
-                if (string.IsNullOrEmpty(_nextMediaPath))
+                    // Each monitor advances in parallel using its own preload
+                    // pipeline. AdvanceContextAsync handles the per-context
+                    // history push internally, so we don't double-push here.
+                    var tasks = selected.Select(AdvanceContextAsync).ToArray();
+                    await Task.WhenAll(tasks);
+
+                    // Mirror the first selected monitor's content into the
+                    // main preview pane so the user has a visual reference.
+                    var first = selected.FirstOrDefault();
+                    if (first?.CurrentPath != null)
+                    {
+                        await UpdateMainPreviewFromContextAsync(first);
+                        _currentMediaPath = first.CurrentPath;
+                        _currentMediaKind = first.CurrentKind;
+                        UpdateFilePathDisplay(first.CurrentPath);
+                    }
+                }
+                else
+                {
+                    // Sync mode: one global pick shown on main + every selected
+                    // monitor (or just main if none are selected).
+                    if (_currentMediaPath != null) PushHistory(_currentMediaPath);
+
+                    if (string.IsNullOrEmpty(_nextMediaPath))
+                        await PreloadNextAsync();
+                    if (string.IsNullOrEmpty(_nextMediaPath)) return;
+
+                    await ShowMediaAsync(_nextMediaPath, _nextImageBuffer);
+
                     await PreloadNextAsync();
-
-                if (string.IsNullOrEmpty(_nextMediaPath)) return;
-
-                await ShowMediaAsync(_nextMediaPath, _nextImageBuffer);
-
-                // Preload the *next* candidate so timer-driven advances stay
-                // smooth.
-                await PreloadNextAsync();
+                }
             }
             finally
             {
@@ -1309,22 +1645,53 @@ namespace RandomMediaPlayer
             }
         }
 
-        // Step back through history (up to MaxHistory entries).
+        // Step back. Sync mode pops the global history; independent mode pops
+        // each selected monitor's own history list.
         public async Task PreviousAsync()
         {
             if (_isAdvancing) return;
-            if (_history.Count == 0) return;
+
+            bool useIndependent = _independentMonitors && AnyMonitorSelected();
 
             _isAdvancing = true;
             _slideshowTimer.Stop();
             try
             {
-                var prev = _history[^1];
-                _history.RemoveAt(_history.Count - 1);
+                if (useIndependent)
+                {
+                    // Only step back monitors that have history to give.
+                    var withHistory = _monitorContexts
+                        .Where(c => c.Selected && c.Window != null && c.History.Count > 0)
+                        .ToList();
+                    if (withHistory.Count == 0) return;
 
-                // For an image we don't have the buffered BitmapImage cached for
-                // history items; ShowMediaAsync will re-load from disk.
-                await ShowMediaAsync(prev, null);
+                    var tasks = withHistory.Select(async ctx =>
+                    {
+                        var prev = ctx.History[^1];
+                        ctx.History.RemoveAt(ctx.History.Count - 1);
+                        var kind = ClassifyMedia(prev);
+                        // ShowOnContextAsync re-loads images from disk; history
+                        // items don't carry a buffered BitmapImage.
+                        await ShowOnContextAsync(ctx, prev, null, kind);
+                    }).ToArray();
+                    await Task.WhenAll(tasks);
+
+                    var first = withHistory.FirstOrDefault();
+                    if (first?.CurrentPath != null)
+                    {
+                        await UpdateMainPreviewFromContextAsync(first);
+                        _currentMediaPath = first.CurrentPath;
+                        _currentMediaKind = first.CurrentKind;
+                        UpdateFilePathDisplay(first.CurrentPath);
+                    }
+                }
+                else
+                {
+                    if (_history.Count == 0) return;
+                    var prev = _history[^1];
+                    _history.RemoveAt(_history.Count - 1);
+                    await ShowMediaAsync(prev, null);
+                }
             }
             finally
             {
@@ -1334,6 +1701,43 @@ namespace RandomMediaPlayer
         }
 
         // ---------- Preloading ----------
+        // Worker-thread random-pick filtered by an orientation. Used by both
+        // the global preload (sync mode) and per-context preload (independent).
+        private async Task<(string? path, BitmapImage? image)> PickRandomMediaAsync(string orientation)
+        {
+            return await Task.Run<(string?, BitmapImage?)>(() =>
+            {
+                int safety = 0;
+                while (safety++ < 200)
+                {
+                    var candidate = GetRandomMedia();
+                    if (candidate == null) return (null, null);
+
+                    var kind = ClassifyMedia(candidate);
+                    if (kind == MediaKind.Image)
+                    {
+                        var bmp = TryLoadBitmap(candidate);
+                        if (bmp == null) continue;
+                        var rotated = ApplyRotationIfNeeded(bmp, candidate);
+                        if (!ImagePassesOrientation(rotated, orientation)) continue;
+                        return (candidate, rotated);
+                    }
+                    else if (kind == MediaKind.Video)
+                    {
+                        if (!VideoPassesFilters(candidate, orientation)) continue;
+                        return (candidate, null);
+                    }
+                    else // Gif (only when classified as Gif by the active mode)
+                    {
+                        return (candidate, null);
+                    }
+                }
+                return (null, null);
+            });
+        }
+
+        // Global preload (sync mode + main preview). Uses the default
+        // orientation filter from the Filters tab.
         private async Task PreloadNextAsync()
         {
             if (_isPreloading) return;
@@ -1341,36 +1745,7 @@ namespace RandomMediaPlayer
 
             try
             {
-                var (path, image) = await Task.Run(() =>
-                {
-                    int safety = 0;
-                    while (safety++ < 200)
-                    {
-                        var candidate = GetRandomMedia();
-                        if (candidate == null) return ((string?)null, (BitmapImage?)null);
-
-                        var kind = ClassifyMedia(candidate);
-                        if (kind == MediaKind.Image)
-                        {
-                            var bmp = TryLoadBitmap(candidate);
-                            if (bmp == null) continue;
-                            var rotated = ApplyRotationIfNeeded(bmp, candidate);
-                            if (!ImagePassesOrientation(rotated)) continue;
-                            return ((string?)candidate, (BitmapImage?)rotated);
-                        }
-                        else if (kind == MediaKind.Video)
-                        {
-                            if (!VideoPassesFilters(candidate)) continue;
-                            return ((string?)candidate, (BitmapImage?)null);
-                        }
-                        else // Gif
-                        {
-                            return ((string?)candidate, (BitmapImage?)null);
-                        }
-                    }
-                    return ((string?)null, (BitmapImage?)null);
-                });
-
+                var (path, image) = await PickRandomMediaAsync(_orientationFilter);
                 _nextMediaPath = path;
                 _nextImageBuffer = image;
             }
@@ -1381,6 +1756,30 @@ namespace RandomMediaPlayer
             finally
             {
                 _isPreloading = false;
+            }
+        }
+
+        // Per-monitor preload for independent mode. Each monitor uses its own
+        // orientation filter; "All" falls back to the default.
+        private async Task PreloadForContextAsync(MonitorContext ctx)
+        {
+            if (ctx.IsPreloading) return;
+            ctx.IsPreloading = true;
+
+            try
+            {
+                string orientation = ctx.OrientationFilter == "All" ? "All" : ctx.OrientationFilter;
+                var (path, image) = await PickRandomMediaAsync(orientation);
+                ctx.NextPath = path;
+                ctx.NextImage = image;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[{ctx.Screen.DeviceName}] Preload error: {ex.Message}");
+            }
+            finally
+            {
+                ctx.IsPreloading = false;
             }
         }
 
@@ -1458,16 +1857,19 @@ namespace RandomMediaPlayer
         }
 
         // ---------- Filters ----------
-        private bool ImagePassesOrientation(BitmapImage bmp)
+        // Orientation parameter so the same filter logic works for the global
+        // pick (uses _orientationFilter) and for per-monitor independent picks
+        // (each monitor passes its own).
+        private static bool ImagePassesOrientation(BitmapImage bmp, string orientation)
         {
-            if (_orientationFilter == "All") return true;
+            if (orientation == "All") return true;
             bool isLandscape = bmp.PixelWidth > bmp.PixelHeight;
             bool isPortrait = bmp.PixelHeight > bmp.PixelWidth;
-            return (_orientationFilter == "Landscape" && isLandscape)
-                || (_orientationFilter == "Vertical" && isPortrait);
+            return (orientation == "Landscape" && isLandscape)
+                || (orientation == "Vertical"  && isPortrait);
         }
 
-        private bool VideoPassesFilters(string path)
+        private bool VideoPassesFilters(string path, string orientation)
         {
             try
             {
@@ -1476,10 +1878,10 @@ namespace RandomMediaPlayer
 
                 if (w < _minWidth || h < _minHeight) return false;
 
-                return _orientationFilter switch
+                return orientation switch
                 {
                     "Landscape" => w > h,
-                    "Vertical" => h > w,
+                    "Vertical"  => h > w,
                     _ => true
                 };
             }
@@ -1490,7 +1892,7 @@ namespace RandomMediaPlayer
             }
         }
 
-        // ---------- Display image ----------
+        // ---------- Display image (sync mode entry point) ----------
         private async Task DisplayImageAsync(string path, BitmapImage? image)
         {
             image ??= TryLoadBitmap(path);
@@ -1499,65 +1901,49 @@ namespace RandomMediaPlayer
 
             await Dispatcher.InvokeAsync(() =>
             {
+                bool scaleToFill = ScaleToFillCheckBox.IsChecked == true;
+                bool showOverlay = ShowPathOverlayCheckBox.IsChecked == true;
+
                 ShowOnly(PreviewImage);
-                PreviewImage.Stretch = ScaleToFillCheckBox.IsChecked == true
-                    ? Stretch.UniformToFill : Stretch.Uniform;
+                PreviewImage.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
                 PreviewImage.Source = rotated;
 
                 _slideshowTimer.Interval =
                     TimeSpan.FromSeconds(double.TryParse(DelayTextBox.Text, out var d) && d > 0 ? d : 3);
 
-                EnsureFullscreen();
-                _fullscreenWindow?.DisplayImage(rotated, ScaleToFillCheckBox.IsChecked == true);
+                SyncMonitorWindows();
+                foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
+                {
+                    ctx.Window!.DisplayImage(rotated, scaleToFill);
+                    ctx.Window!.SetPathOverlay(path, showOverlay);
+                }
             });
         }
 
-        // ---------- Display video / GIF ----------
+        // ---------- Display video / GIF (sync mode entry point) ----------
         private async Task PlayVideoOrGifAsync(string path, MediaKind kind)
         {
-            double clipMs = (double.TryParse(DelayTextBox.Text, out var d) && d > 0 ? d : 10) * 1000;
-            int startTimeMs = 0;
-
-            if (kind == MediaKind.Video && !GifExtensions.Contains(Path.GetExtension(path))
-                && !string.Equals(Path.GetExtension(path), ".webm", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    var info = new MediaInfoWrapper(path, NullLogger<MediaInfoWrapper>.Instance);
-                    long duration = info.Duration;
-                    if (duration > clipMs)
-                    {
-                        long maxStart = duration - (long)clipMs;
-                        startTimeMs = _random.Next(0, (int)maxStart);
-                        _slideshowTimer.Interval = TimeSpan.FromMilliseconds(clipMs);
-                    }
-                    else
-                    {
-                        _slideshowTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(duration, 1000));
-                    }
-                }
-                catch
-                {
-                    _slideshowTimer.Interval = TimeSpan.FromMilliseconds(clipMs);
-                }
-            }
-            else
-            {
-                _slideshowTimer.Interval = TimeSpan.FromMilliseconds(clipMs);
-            }
+            (double clipMs, int startTimeMs) = ComputeVideoTiming(path, kind);
+            _slideshowTimer.Interval = TimeSpan.FromMilliseconds(clipMs);
 
             await Dispatcher.InvokeAsync(() =>
             {
-                EnsureFullscreen();
+                bool scaleToFill = ScaleToFillCheckBox.IsChecked == true;
+                bool showOverlay = ShowPathOverlayCheckBox.IsChecked == true;
+
+                SyncMonitorWindows();
 
                 if (kind == MediaKind.Gif)
                 {
                     ShowOnly(GifPlayer);
-                    GifPlayer.Stretch = ScaleToFillCheckBox.IsChecked == true
-                        ? Stretch.UniformToFill : Stretch.Uniform;
+                    GifPlayer.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
                     GifPlayer.Source = new Uri(path, UriKind.Absolute);
                     GifPlayer.Play();
-                    _fullscreenWindow?.PlayGif(path, ScaleToFillCheckBox.IsChecked == true);
+                    foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
+                    {
+                        ctx.Window!.PlayGif(path, scaleToFill);
+                        ctx.Window!.SetPathOverlay(path, showOverlay);
+                    }
                 }
                 else
                 {
@@ -1577,9 +1963,87 @@ namespace RandomMediaPlayer
                     mp.Audio.Volume = MuteCheckBox.IsChecked == true ? 0 : 100;
                     mp.Play(new Uri(path));
                     mp.Time = startTimeMs;
-                    _fullscreenWindow?.PlayVideo(path, startTimeMs);
+                    foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
+                    {
+                        ctx.Window!.PlayVideo(path, startTimeMs);
+                        ctx.Window!.SetPathOverlay(path, showOverlay);
+                    }
                 }
             });
+        }
+
+        // Computes (timer interval ms, random start position ms) for a given file.
+        private (double clipMs, int startTimeMs) ComputeVideoTiming(string path, MediaKind kind)
+        {
+            double clipMs = (double.TryParse(DelayTextBox.Text, out var d) && d > 0 ? d : 10) * 1000;
+            int startTimeMs = 0;
+
+            if (kind == MediaKind.Video && !GifExtensions.Contains(Path.GetExtension(path))
+                && !string.Equals(Path.GetExtension(path), ".webm", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var info = new MediaInfoWrapper(path, NullLogger<MediaInfoWrapper>.Instance);
+                    long duration = info.Duration;
+                    if (duration > clipMs)
+                    {
+                        long maxStart = duration - (long)clipMs;
+                        startTimeMs = _random.Next(0, (int)maxStart);
+                    }
+                    else
+                    {
+                        clipMs = Math.Max(duration, 1000);
+                    }
+                }
+                catch { /* fall back to clipMs default */ }
+            }
+            return (clipMs, startTimeMs);
+        }
+
+        // ---------- Independent-mode per-context display ----------
+        // Pushes a single piece of media into one specific monitor's window.
+        private async Task ShowOnContextAsync(MonitorContext ctx, string path,
+                                              BitmapImage? bufferedImage, MediaKind kind)
+        {
+            if (ctx.Window == null) return;
+
+            // Stop other media kinds on this window first (so a still-playing
+            // video doesn't fire EndReached past the new image, etc.).
+            ctx.Window.StopPlaybackOfOtherKinds(kind);
+            ctx.CurrentKind = kind;
+            ctx.CurrentPath = path;
+
+            bool scaleToFill = ScaleToFillCheckBox.IsChecked == true;
+            bool showOverlay = ShowPathOverlayCheckBox.IsChecked == true;
+
+            if (kind == MediaKind.Image)
+            {
+                var bmp = bufferedImage ?? TryLoadBitmap(path);
+                if (bmp == null) return;
+                var rotated = ApplyRotationIfNeeded(bmp, path);
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    ctx.Window?.DisplayImage(rotated, scaleToFill);
+                    ctx.Window?.SetPathOverlay(path, showOverlay);
+                });
+            }
+            else if (kind == MediaKind.Gif)
+            {
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    ctx.Window?.PlayGif(path, scaleToFill);
+                    ctx.Window?.SetPathOverlay(path, showOverlay);
+                });
+            }
+            else // Video
+            {
+                (_, int startTimeMs) = ComputeVideoTiming(path, kind);
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    ctx.Window?.PlayVideo(path, startTimeMs);
+                    ctx.Window?.SetPathOverlay(path, showOverlay);
+                });
+            }
         }
 
         private void ShowOnly(UIElement element)
@@ -1591,14 +2055,9 @@ namespace RandomMediaPlayer
         }
 
         // Halts playback of any media that isn't of the kind we're about to show.
-        // Without this, in mixed mode a video keeps running behind a photo and its
-        // natural end fires AdvanceToNextMedia, skipping past the photo instantly.
-        //
-        // Uses Pause (not Stop) on VLC: libvlc's Stop synchronously waits for the
-        // media thread to wind down, which deadlocks against an in-flight
-        // EndReached callback chain. Pause is sufficient here - our EndReached
-        // handler is gated on _currentMediaKind, so a paused, hidden video can't
-        // erroneously trigger an advance.
+        // Pause (not Stop) on VLC to avoid the wind-down deadlock; EndReached gate
+        // on _currentMediaKind keeps the paused-but-buffered video harmless.
+        // Applied to the main window's preview AND every monitor's fullscreen window.
         private void StopPlaybackOfOtherKinds(MediaKind incoming)
         {
             if (incoming != MediaKind.Video)
@@ -1621,45 +2080,8 @@ namespace RandomMediaPlayer
                 catch (Exception ex) { Debug.WriteLine($"GifPlayer stop failed: {ex.Message}"); }
             }
 
-            _fullscreenWindow?.StopPlaybackOfOtherKinds(incoming);
-        }
-
-        // ---------- Fullscreen window ----------
-        private void EnsureFullscreen()
-        {
-            // "None" means preview-only - never spawn a fullscreen window.
-            if (IsNoneMonitorSelected())
-            {
-                if (_fullscreenWindow != null)
-                {
-                    _fullscreenWindow.Close();
-                    _fullscreenWindow = null;
-                }
-                return;
-            }
-
-            if (_fullscreenWindow != null && _fullscreenWindow.IsLoaded) return;
-
-            int idx = GetSelectedMonitorIndex();
-            if (idx < 0 || idx >= _monitors.Length)
-            {
-                MessageBox.Show("Please select a valid monitor.");
-                return;
-            }
-
-            var mon = _monitors[idx];
-            _fullscreenWindow = new FullscreenSlideshowWindow(this)
-            {
-                WindowStartupLocation = WindowStartupLocation.Manual,
-                Left = mon.WpfWorkingArea.Left,
-                Top = mon.WpfWorkingArea.Top,
-                Width = mon.WpfWorkingArea.Width,
-                Height = mon.WpfWorkingArea.Height,
-                Topmost = AlwaysOnTopCheckBox.IsChecked == true
-            };
-            _fullscreenWindow.Closed += (s, e) => _fullscreenWindow = null;
-            _fullscreenWindow.Show();
-            _fullscreenWindow.WindowState = WindowState.Maximized;
+            foreach (var ctx in _monitorContexts.Where(c => c.Window != null))
+                ctx.Window!.StopPlaybackOfOtherKinds(incoming);
         }
 
         private void GifPlayer_MediaEnded(object sender, RoutedEventArgs e)
@@ -1697,9 +2119,9 @@ namespace RandomMediaPlayer
             }
             else
             {
-                // Row 9 is the preview row in the new layout (was 8 before the
-                // hotkey config row was added).
-                Grid.SetRow(border, 9);
+                // Row 6 is the preview row in the current layout
+                // (header, mode tabs, toolbar, progress, settings tabs, file path, preview).
+                Grid.SetRow(border, 6);
                 Grid.SetRowSpan(border, 1);
                 Panel.SetZIndex(border, 0);
                 _isPreviewEnlarged = false;
@@ -1837,12 +2259,12 @@ namespace RandomMediaPlayer
         // ---------- Settings persistence ----------
         private void ApplyLoadedSettings(AppSettings s)
         {
-            // Mode
+            // Mode (drives the header TabControl)
             switch (s.Mode)
             {
-                case "Video": VideoModeRadio.IsChecked = true; _mode = MediaMode.Video; break;
-                case "Mixed": MixedModeRadio.IsChecked = true; _mode = MediaMode.Mixed; break;
-                default:      PhotoModeRadio.IsChecked = true; _mode = MediaMode.Photo; break;
+                case "Video": ModeTabControl.SelectedIndex = 1; _mode = MediaMode.Video; break;
+                case "Mixed": ModeTabControl.SelectedIndex = 2; _mode = MediaMode.Mixed; break;
+                default:      ModeTabControl.SelectedIndex = 0; _mode = MediaMode.Photo; break;
             }
 
             // Orientation
@@ -1868,22 +2290,50 @@ namespace RandomMediaPlayer
             this.Topmost = s.AlwaysOnTop;
             ScaleToFillCheckBox.IsChecked = s.ScaleToFill;
             MuteCheckBox.IsChecked = s.Mute;
+            ShowPathOverlayCheckBox.IsChecked = s.ShowPathOverlay;
 
-            // Monitor: match by device name; fall back to None on mismatch.
-            int idx = 0;
-            if (!string.IsNullOrEmpty(s.MonitorDeviceName))
+            // Theme: select the matching combo item AND set Application.ThemeMode
+            // before _uiInitialized goes true so the SelectionChanged handler
+            // doesn't double-apply.
+            ThemeComboBox.SelectedIndex = s.Theme switch
             {
-                for (int i = 0; i < _monitors.Length; i++)
+                "Light"  => 0,
+                "System" => 2,
+                _        => 1, // Dark default
+            };
+            ApplyThemeFromCombo();
+
+            // Monitor configs: match each saved entry to a current MonitorContext
+            // by device name. Monitors that no longer exist are silently dropped;
+            // newly-attached monitors retain their default (Selected=false, All).
+            if (s.Monitors != null)
+            {
+                foreach (var saved in s.Monitors)
                 {
-                    if (string.Equals(_monitors[i].DeviceName, s.MonitorDeviceName,
-                                      StringComparison.OrdinalIgnoreCase))
-                    {
-                        idx = i + 1; // +1 for the leading None entry
-                        break;
-                    }
+                    var ctx = _monitorContexts.FirstOrDefault(c =>
+                        string.Equals(c.Screen.DeviceName, saved.DeviceName,
+                                      StringComparison.OrdinalIgnoreCase));
+                    if (ctx == null) continue;
+                    ctx.Selected = saved.Selected;
+                    ctx.OrientationFilter = string.IsNullOrEmpty(saved.Orientation)
+                        ? "All" : saved.Orientation;
                 }
             }
-            MonitorComboBox.SelectedIndex = idx;
+            // Backward compat: a settings.json from before this multi-monitor
+            // change has MonitorDeviceName instead of a Monitors list.
+            else if (!string.IsNullOrEmpty(s.MonitorDeviceName))
+            {
+                var ctx = _monitorContexts.FirstOrDefault(c =>
+                    string.Equals(c.Screen.DeviceName, s.MonitorDeviceName,
+                                  StringComparison.OrdinalIgnoreCase));
+                if (ctx != null) ctx.Selected = true;
+            }
+
+            _independentMonitors = s.IndependentMonitors;
+            if (_independentMonitors)
+                IndependentMonitorsRadio.IsChecked = true;
+            else
+                SyncMonitorsRadio.IsChecked = true;
 
             // Panic hotkey
             if (Enum.TryParse<Key>(s.PanicKey, out var panicKey))
@@ -1933,10 +2383,16 @@ namespace RandomMediaPlayer
                     AlwaysOnTop = AlwaysOnTopCheckBox.IsChecked == true,
                     ScaleToFill = ScaleToFillCheckBox.IsChecked == true,
                     Mute = MuteCheckBox.IsChecked == true,
-                    MonitorDeviceName = IsNoneMonitorSelected() || GetSelectedMonitorIndex() < 0 ||
-                                        GetSelectedMonitorIndex() >= _monitors.Length
-                                            ? ""
-                                            : _monitors[GetSelectedMonitorIndex()].DeviceName,
+                    ShowPathOverlay = ShowPathOverlayCheckBox.IsChecked == true,
+                    Theme = (ThemeComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Dark",
+                    Monitors = _monitorContexts.Select(c => new AppSettings.MonitorConfig
+                    {
+                        DeviceName = c.Screen.DeviceName,
+                        Selected = c.Selected,
+                        Orientation = c.OrientationFilter,
+                    }).ToList(),
+                    IndependentMonitors = _independentMonitors,
+                    MonitorDeviceName = "", // legacy field, no longer used
                     PanicKey = _panicKey.ToString(),
                     PanicCtrl = PanicCtrlCheckBox.IsChecked == true,
                     PanicAlt = PanicAltCheckBox.IsChecked == true,
@@ -1971,7 +2427,7 @@ namespace RandomMediaPlayer
             UninstallAllHotkeys();
             _hwndSource?.RemoveHook(WndProcHook);
 
-            _fullscreenWindow?.Close();
+            CloseAllMonitorWindows();
             Application.Current.Shutdown();
         }
     }
