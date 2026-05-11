@@ -181,6 +181,10 @@ namespace RandomMediaPlayer
         private Key _holdKey = Key.F9;
         private bool _holdHotkeyRegistered;
         private bool _isOnHold;
+        // Read by fullscreen windows from their own VLC EndReached so each
+        // monitor can self-loop in hold mode without us fanning the loop out
+        // (which would mis-restart videos on other monitors in independent mode).
+        internal bool IsOnHold => _isOnHold;
 
         // When true, we observe keys via WH_KEYBOARD_LL (works across multiple
         // app instances). When false, we claim them via RegisterHotKey
@@ -680,12 +684,17 @@ namespace RandomMediaPlayer
                 VlcCanvas.SourceProvider.MediaPlayer.EndReached +=
                     (s, e) => Dispatcher.BeginInvoke(() =>
                     {
-                        // Stale event guard: only honor EndReached when this kind
-                        // is currently displayed.
-                        if (_currentMediaKind != MediaKind.Video) return;
+                        // Stale event guard: VLC drives both videos and gifs now,
+                        // so honor EndReached for either kind (skip when an image
+                        // is on screen).
+                        if (_currentMediaKind == MediaKind.Image) return;
 
-                        // Held: replay the current clip on its source instead of
-                        // advancing to the next file.
+                        // Held: replay the current clip on the main preview's
+                        // VLC. Each fullscreen monitor watches its own VLC's
+                        // EndReached and self-loops - we can't fan out from
+                        // here because in independent mode every monitor is
+                        // playing a different file, so a blanket replay would
+                        // restart videos that haven't ended yet.
                         if (_isOnHold)
                         {
                             try
@@ -693,7 +702,7 @@ namespace RandomMediaPlayer
                                 var mp = VlcCanvas.SourceProvider.MediaPlayer;
                                 if (mp != null && _currentMediaPath != null)
                                 {
-                                    mp.Play(new Uri(_currentMediaPath));
+                                    mp.Play(new Uri(_currentMediaPath), VlcOptionsFor(_currentMediaKind));
                                 }
                             }
                             catch (Exception ex) { Debug.WriteLine($"[Hold] VLC loop failed: {ex.Message}"); }
@@ -1370,8 +1379,6 @@ namespace RandomMediaPlayer
             }
             catch { }
 
-            try { GifPlayer.Stop(); } catch { }
-
             // Close every monitor's fullscreen window and clear runtime state.
             CloseAllMonitorWindows();
         }
@@ -1518,29 +1525,23 @@ namespace RandomMediaPlayer
                     PreviewImage.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
                     PreviewImage.Source = bmp;
                 }
-                else if (kind == MediaKind.Gif)
-                {
-                    ShowOnly(GifPlayer);
-                    GifPlayer.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
-                    GifPlayer.Source = new Uri(path, UriKind.Absolute);
-                    GifPlayer.Play();
-                }
-                else // Video
+                else // Video or Gif - both go through VLC
                 {
                     if (!_vlcInitialized) return;
                     ShowOnly(VlcCanvas);
                     var mp = VlcCanvas.SourceProvider.MediaPlayer;
-                    mp.Audio.Volume = MuteCheckBox.IsChecked == true ? 0 : 100;
-                    mp.Play(new Uri(path));
+                    mp.Audio.Volume = (kind == MediaKind.Gif || MuteCheckBox.IsChecked == true) ? 0 : 100;
+                    mp.Play(new Uri(path), VlcOptionsFor(kind));
                 }
             });
         }
 
         // Like StopPlaybackOfOtherKinds but only touches the main window's
-        // own preview elements (not monitor windows).
+        // own preview elements (not monitor windows). Both Video and Gif live
+        // in VLC, so only stop it when switching to a still image.
         private void StopPreviewOfOtherKinds(MediaKind incoming)
         {
-            if (incoming != MediaKind.Video)
+            if (incoming == MediaKind.Image)
             {
                 try
                 {
@@ -1548,10 +1549,6 @@ namespace RandomMediaPlayer
                         VlcCanvas.SourceProvider.MediaPlayer.Pause();
                 }
                 catch { }
-            }
-            if (incoming != MediaKind.Gif)
-            {
-                try { GifPlayer.Stop(); GifPlayer.Source = null; } catch { }
             }
         }
 
@@ -1729,6 +1726,16 @@ namespace RandomMediaPlayer
                     }
                     else // Gif (only when classified as Gif by the active mode)
                     {
+                        // The first frame's pixel dimensions match the animation's
+                        // dimensions, so a static BitmapImage is enough to apply
+                        // the orientation filter. We don't keep the bitmap - VLC
+                        // will play the file directly.
+                        if (orientation != "All")
+                        {
+                            var bmp = TryLoadBitmap(candidate);
+                            if (bmp == null) continue;
+                            if (!ImagePassesOrientation(bmp, orientation)) continue;
+                        }
                         return (candidate, null);
                     }
                 }
@@ -1737,7 +1744,10 @@ namespace RandomMediaPlayer
         }
 
         // Global preload (sync mode + main preview). Uses the default
-        // orientation filter from the Filters tab.
+        // orientation filter from the Filters tab. For video / gif picks we
+        // also push the path into each selected monitor's ping-pong VLC so
+        // the file is opened + decoded ahead of time and the advance is just
+        // a Visibility swap + resume.
         private async Task PreloadNextAsync()
         {
             if (_isPreloading) return;
@@ -1748,6 +1758,16 @@ namespace RandomMediaPlayer
                 var (path, image) = await PickRandomMediaAsync(_orientationFilter);
                 _nextMediaPath = path;
                 _nextImageBuffer = image;
+
+                if (!string.IsNullOrEmpty(path))
+                {
+                    var kind = ClassifyMedia(path);
+                    if (kind != MediaKind.Image)
+                    {
+                        foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
+                            ctx.Window!.PreloadMedia(path, kind);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1760,7 +1780,8 @@ namespace RandomMediaPlayer
         }
 
         // Per-monitor preload for independent mode. Each monitor uses its own
-        // orientation filter; "All" falls back to the default.
+        // orientation filter; "All" falls back to the default. Video / gif
+        // picks are also pushed into this monitor's ping-pong VLC.
         private async Task PreloadForContextAsync(MonitorContext ctx)
         {
             if (ctx.IsPreloading) return;
@@ -1772,6 +1793,13 @@ namespace RandomMediaPlayer
                 var (path, image) = await PickRandomMediaAsync(orientation);
                 ctx.NextPath = path;
                 ctx.NextImage = image;
+
+                if (!string.IsNullOrEmpty(path) && ctx.Window != null)
+                {
+                    var kind = ClassifyMedia(path);
+                    if (kind != MediaKind.Image)
+                        ctx.Window.PreloadMedia(path, kind);
+                }
             }
             catch (Exception ex)
             {
@@ -1920,7 +1948,21 @@ namespace RandomMediaPlayer
             });
         }
 
+        // libvlc's built-in gif demuxer treats the file as a single still
+        // image (it only emits the first frame). Forcing the avformat (FFmpeg)
+        // demuxer makes it iterate every frame and animate properly. Static
+        // images that happen to ship under an animated extension (e.g. a
+        // non-animated .jfif) still render correctly via avformat.
+        private static readonly string[] GifVlcOptions = { ":demux=avformat" };
+        private static readonly string[] NoVlcOptions = Array.Empty<string>();
+        private static string[] VlcOptionsFor(MediaKind kind) =>
+            kind == MediaKind.Gif ? GifVlcOptions : NoVlcOptions;
+
         // ---------- Display video / GIF (sync mode entry point) ----------
+        // Gifs are routed through VLC too - the WPF MediaElement that used to
+        // host them had a multi-hundred-ms startup penalty on every Source
+        // change, which appeared as a visible pause between clips. libvlc's
+        // gif demuxer starts within a frame or two.
         private async Task PlayVideoOrGifAsync(string path, MediaKind kind)
         {
             (double clipMs, int startTimeMs) = ComputeVideoTiming(path, kind);
@@ -1933,41 +1975,32 @@ namespace RandomMediaPlayer
 
                 SyncMonitorWindows();
 
-                if (kind == MediaKind.Gif)
+                if (!_vlcInitialized)
                 {
-                    ShowOnly(GifPlayer);
-                    GifPlayer.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
-                    GifPlayer.Source = new Uri(path, UriKind.Absolute);
-                    GifPlayer.Play();
-                    foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
-                    {
-                        ctx.Window!.PlayGif(path, scaleToFill);
-                        ctx.Window!.SetPathOverlay(path, showOverlay);
-                    }
+                    MessageBox.Show(
+                        "Video / animated playback requires libvlc, which was not found.\n\n" +
+                        "Install VLC media player from https://www.videolan.org/vlc/ " +
+                        "(64-bit if your Windows is 64-bit) and restart the app. " +
+                        "The default install location is automatically detected.",
+                        "libvlc not found",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
                 }
-                else
+
+                ShowOnly(VlcCanvas);
+                var mp = VlcCanvas.SourceProvider.MediaPlayer;
+                // Gifs are silent; only un/mute matters for real videos.
+                mp.Audio.Volume = (kind == MediaKind.Gif || MuteCheckBox.IsChecked == true) ? 0 : 100;
+                mp.Play(new Uri(path), VlcOptionsFor(kind));
+                if (kind == MediaKind.Video) mp.Time = startTimeMs;
+
+                foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
                 {
-                    if (!_vlcInitialized)
-                    {
-                        MessageBox.Show(
-                            "Video playback requires libvlc, which was not found.\n\n" +
-                            "Install VLC media player from https://www.videolan.org/vlc/ " +
-                            "(64-bit if your Windows is 64-bit) and restart the app. " +
-                            "The default install location is automatically detected.",
-                            "libvlc not found",
-                            MessageBoxButton.OK, MessageBoxImage.Warning);
-                        return;
-                    }
-                    ShowOnly(VlcCanvas);
-                    var mp = VlcCanvas.SourceProvider.MediaPlayer;
-                    mp.Audio.Volume = MuteCheckBox.IsChecked == true ? 0 : 100;
-                    mp.Play(new Uri(path));
-                    mp.Time = startTimeMs;
-                    foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
-                    {
+                    if (kind == MediaKind.Gif)
+                        ctx.Window!.PlayGif(path, scaleToFill);
+                    else
                         ctx.Window!.PlayVideo(path, startTimeMs);
-                        ctx.Window!.SetPathOverlay(path, showOverlay);
-                    }
+                    ctx.Window!.SetPathOverlay(path, showOverlay);
                 }
             });
         }
@@ -2051,16 +2084,17 @@ namespace RandomMediaPlayer
             PreviewPlaceholder.Visibility = Visibility.Collapsed;
             PreviewImage.Visibility = element == PreviewImage ? Visibility.Visible : Visibility.Collapsed;
             VlcCanvas.Visibility = element == VlcCanvas ? Visibility.Visible : Visibility.Collapsed;
-            GifPlayer.Visibility = element == GifPlayer ? Visibility.Visible : Visibility.Collapsed;
         }
 
         // Halts playback of any media that isn't of the kind we're about to show.
         // Pause (not Stop) on VLC to avoid the wind-down deadlock; EndReached gate
-        // on _currentMediaKind keeps the paused-but-buffered video harmless.
+        // on _currentMediaKind keeps the paused-but-buffered media harmless.
         // Applied to the main window's preview AND every monitor's fullscreen window.
+        // Video and Gif both live in VLC, so it only needs pausing when the
+        // incoming kind is a still image.
         private void StopPlaybackOfOtherKinds(MediaKind incoming)
         {
-            if (incoming != MediaKind.Video)
+            if (incoming == MediaKind.Image)
             {
                 try
                 {
@@ -2070,38 +2104,8 @@ namespace RandomMediaPlayer
                 catch (Exception ex) { Debug.WriteLine($"VLC pause failed: {ex.Message}"); }
             }
 
-            if (incoming != MediaKind.Gif)
-            {
-                try
-                {
-                    GifPlayer.Stop();
-                    GifPlayer.Source = null;
-                }
-                catch (Exception ex) { Debug.WriteLine($"GifPlayer stop failed: {ex.Message}"); }
-            }
-
             foreach (var ctx in _monitorContexts.Where(c => c.Window != null))
                 ctx.Window!.StopPlaybackOfOtherKinds(incoming);
-        }
-
-        private void GifPlayer_MediaEnded(object sender, RoutedEventArgs e)
-        {
-            // Stale event guard.
-            if (_currentMediaKind != MediaKind.Gif) return;
-
-            // Held: rewind and loop the same gif.
-            if (_isOnHold)
-            {
-                try
-                {
-                    GifPlayer.Position = TimeSpan.Zero;
-                    GifPlayer.Play();
-                }
-                catch (Exception ex) { Debug.WriteLine($"[Hold] GIF loop failed: {ex.Message}"); }
-                return;
-            }
-
-            if (_isSlideshowRunning) AdvanceToNextMedia();
         }
 
         // ---------- Preview enlarge ----------

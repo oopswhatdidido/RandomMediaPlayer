@@ -8,12 +8,14 @@
         <Image x:Name="FullscreenImage" Stretch="Uniform"
                HorizontalAlignment="Center" VerticalAlignment="Center"
                Visibility="Collapsed"/>
+        <!-- Two VLC canvases that ping-pong: one shows the current media, the
+             other preloads the next clip (opened + paused at first frame via
+             :start-paused). At advance time the swap is just a Visibility
+             toggle + Play() resume, which removes the open/parse/decode cost
+             from the hot path - especially noticeable on the second+ monitor
+             when sync mode advances every player simultaneously. -->
         <Vlc:VlcControl x:Name="VlcCanvas" Visibility="Collapsed"/>
-        <MediaElement x:Name="GifPlayer"
-                      LoadedBehavior="Manual"
-                      UnloadedBehavior="Stop"
-                      Stretch="Uniform"
-                      Visibility="Collapsed"/>
+        <Vlc:VlcControl x:Name="VlcCanvasB" Visibility="Collapsed"/>
 
         <!-- Path overlay (clickable). Last in the Grid so it z-orders on top.
              Vlc.DotNet.Wpf renders via D3DImage (not HwndHost), so a regular

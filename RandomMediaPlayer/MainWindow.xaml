@@ -334,12 +334,6 @@
                        HorizontalAlignment="Center" VerticalAlignment="Center"
                        Visibility="Collapsed"/>
                 <Vlc:VlcControl x:Name="VlcCanvas" Visibility="Collapsed"/>
-                <MediaElement x:Name="GifPlayer"
-                              LoadedBehavior="Manual"
-                              UnloadedBehavior="Stop"
-                              Stretch="Uniform"
-                              Visibility="Collapsed"
-                              MediaEnded="GifPlayer_MediaEnded"/>
                 <TextBlock x:Name="PreviewPlaceholder"
                            Text="Preview will appear here"
                            HorizontalAlignment="Center" VerticalAlignment="Center"
