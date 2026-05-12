@@ -253,7 +253,7 @@
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,4,0,4">
-                        <TextBlock Text="Min video size:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBlock Text="Min size:" VerticalAlignment="Center" Margin="0,0,6,0"/>
                         <TextBox x:Name="MinWidthTextBox" Text="500" Width="70"
                                  TextChanged="MinSizeTextBox_TextChanged"
                                  VerticalContentAlignment="Center"/>
@@ -261,7 +261,7 @@
                         <TextBox x:Name="MinHeightTextBox" Text="500" Width="70"
                                  TextChanged="MinSizeTextBox_TextChanged"
                                  VerticalContentAlignment="Center"/>
-                        <TextBlock Text="(filters videos by minimum pixel dimensions)"
+                        <TextBlock Text="(filters photos, gifs, and videos by minimum pixel dimensions)"
                                    Opacity="0.65" FontStyle="Italic"
                                    Margin="12,0,0,0" VerticalAlignment="Center"/>
                     </StackPanel>

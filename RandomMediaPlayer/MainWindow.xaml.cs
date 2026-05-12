@@ -1716,6 +1716,7 @@ namespace RandomMediaPlayer
                         var bmp = TryLoadBitmap(candidate);
                         if (bmp == null) continue;
                         var rotated = ApplyRotationIfNeeded(bmp, candidate);
+                        if (!ImagePassesSize(rotated)) continue;
                         if (!ImagePassesOrientation(rotated, orientation)) continue;
                         return (candidate, rotated);
                     }
@@ -1728,14 +1729,12 @@ namespace RandomMediaPlayer
                     {
                         // The first frame's pixel dimensions match the animation's
                         // dimensions, so a static BitmapImage is enough to apply
-                        // the orientation filter. We don't keep the bitmap - VLC
-                        // will play the file directly.
-                        if (orientation != "All")
-                        {
-                            var bmp = TryLoadBitmap(candidate);
-                            if (bmp == null) continue;
-                            if (!ImagePassesOrientation(bmp, orientation)) continue;
-                        }
+                        // both filters. We don't keep the bitmap - VLC will play
+                        // the file directly.
+                        var bmp = TryLoadBitmap(candidate);
+                        if (bmp == null) continue;
+                        if (!ImagePassesSize(bmp)) continue;
+                        if (!ImagePassesOrientation(bmp, orientation)) continue;
                         return (candidate, null);
                     }
                 }
@@ -1896,6 +1895,12 @@ namespace RandomMediaPlayer
             return (orientation == "Landscape" && isLandscape)
                 || (orientation == "Vertical"  && isPortrait);
         }
+
+        // Min-size filter applied to images and gifs. The same _minWidth /
+        // _minHeight values feed VideoPassesFilters too, so the field in the
+        // UI is a single "min size" knob that covers every media kind.
+        private bool ImagePassesSize(BitmapImage bmp) =>
+            bmp.PixelWidth >= _minWidth && bmp.PixelHeight >= _minHeight;
 
         private bool VideoPassesFilters(string path, string orientation)
         {
