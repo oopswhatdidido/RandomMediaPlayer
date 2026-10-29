@@ -22,6 +22,9 @@ namespace RandomMediaPlayer
         public double DelaySeconds { get; set; } = 3;
         public int MinWidth { get; set; } = 500;
         public int MinHeight { get; set; } = 500;
+        // When true, media whose pixel dimensions are smaller than the target
+        // monitor (and would therefore be stretched up) is skipped.
+        public bool NoUpscale { get; set; }
 
         // Display + playback options
         public bool AlwaysOnTop { get; set; }

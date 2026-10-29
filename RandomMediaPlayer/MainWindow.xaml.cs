@@ -2,8 +2,8 @@ using MediaInfo;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ookii.Dialogs.Wpf;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -74,10 +74,25 @@ namespace RandomMediaPlayer
         private string _orientationFilter = "All";
 
         private readonly List<string> _selectedFolders = new();
-        private readonly ObservableCollection<string> _mediaFiles = new();
+        // Treated as immutable once assigned: every scan / delete swaps in a
+        // fresh list, so worker-thread pick loops can index a snapshot safely
+        // without locking.
+        private List<string> _mediaFiles = new();
+
+        // Cheap per-file metadata (dimensions, EXIF rotation, duration) keyed
+        // by path. Filled lazily by the pick loop, cleared on every rescan.
+        // A failed probe is cached too (Width == 0) so a broken file is
+        // rejected instantly instead of being re-opened on every pick.
+        private readonly ConcurrentDictionary<string, MediaProbe> _probeCache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        // Largest monitor dimensions in physical pixels. Images bigger than
+        // this are decoded downscaled (DecodePixelWidth) - a 50 MP photo has
+        // no more pixels on screen than a 4K one, but costs 10x the decode
+        // time and memory at full size.
+        private int _decodeCapW, _decodeCapH;
 
         private DispatcherTimer _slideshowTimer = null!;
-        private readonly Random _random = new();
         private Screen[] _monitors = Array.Empty<Screen>();
 
         // Per-monitor configuration + runtime state. UI-bound, persisted.
@@ -91,14 +106,26 @@ namespace RandomMediaPlayer
         private string? _currentMediaPath;
         private MediaKind _currentMediaKind = MediaKind.Image;
         private string? _nextMediaPath;
-        private BitmapImage? _nextImageBuffer;
-        private bool _isPreloading;
+        private BitmapSource? _nextImageBuffer;
+        // Decoded bitmap currently shown in sync mode (null for video / gif),
+        // so a monitor checked mid-show receives the image on screen rather
+        // than the one queued up next.
+        private BitmapSource? _currentImage;
+        // Bumped whenever a filter or the file list changes. A pick that
+        // started under an older generation is discarded and redone, so a
+        // stale candidate can never slip through to the screen.
+        private int _filterGeneration;
+        // In-flight global preload. Advances await it (or start one) rather
+        // than running the pick inline, so preloading overlaps the display
+        // interval instead of delaying the timer restart.
+        private Task? _preloadTask;
         private bool _isAdvancing;
         private bool _isSlideshowRunning;
         private bool _isPreviewEnlarged;
         private bool _includeAnimated;
         private int _minWidth = 500;
         private int _minHeight = 500;
+        private bool _noUpscale;
 
         private bool _vlcInitialized;
 
@@ -841,6 +868,35 @@ namespace RandomMediaPlayer
             if (LandscapeRadio?.IsChecked == true) _orientationFilter = "Landscape";
             else if (VerticalRadio?.IsChecked == true) _orientationFilter = "Vertical";
             else _orientationFilter = "All";
+            InvalidatePreloads();
+        }
+
+        private void NoUpscaleCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _noUpscale = NoUpscaleCheckBox.IsChecked == true;
+            InvalidatePreloads();
+        }
+
+        // Fill vs. fit changes what "would be upscaled" means, so a pending
+        // pick made under the old rule is discarded.
+        private void ScaleToFillCheckBox_Changed(object sender, RoutedEventArgs e) =>
+            InvalidatePreloads();
+
+        // Drops any already-picked "next" item (global and per-monitor) so the
+        // next advance re-picks under the current filter settings, then starts
+        // a fresh preload in the background.
+        private void InvalidatePreloads()
+        {
+            if (!_uiInitialized) return;
+            _filterGeneration++;
+            _nextMediaPath = null;
+            _nextImageBuffer = null;
+            foreach (var ctx in _monitorContexts)
+            {
+                ctx.NextPath = null;
+                ctx.NextImage = null;
+            }
+            if (_mediaFiles.Count > 0) StartPreload();
         }
 
         private void AlwaysOnTopCheckBox_Changed(object sender, RoutedEventArgs e)
@@ -896,6 +952,7 @@ namespace RandomMediaPlayer
 
             if (int.TryParse(MinWidthTextBox.Text, out var w) && w >= 0) _minWidth = w;
             if (int.TryParse(MinHeightTextBox.Text, out var h) && h >= 0) _minHeight = h;
+            InvalidatePreloads();
         }
 
         private void DelayTextBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -914,6 +971,10 @@ namespace RandomMediaPlayer
                 .Select((s, i) => new MonitorContext(i, s))
                 .ToList();
             MonitorsItemsControl.ItemsSource = _monitorContexts;
+
+            // Screen.Bounds is in physical pixels (WpfBounds would be DIPs).
+            _decodeCapW = _monitors.Length > 0 ? _monitors.Max(m => (int)m.Bounds.Width) : 0;
+            _decodeCapH = _monitors.Length > 0 ? _monitors.Max(m => (int)m.Bounds.Height) : 0;
         }
 
         // Open / close the fullscreen window per monitor based on its Selected
@@ -950,8 +1011,10 @@ namespace RandomMediaPlayer
                     ctx.Window = null;
                     // Drop runtime state so a re-tick on this context is fresh.
                     ctx.CurrentPath = null;
+                    ctx.CurrentImage = null;
                     ctx.NextPath = null;
                     ctx.NextImage = null;
+                    ctx.PreloadTask = null;
                     ctx.History.Clear();
                 }
             }
@@ -968,10 +1031,11 @@ namespace RandomMediaPlayer
                     ctx.Window = null;
                 }
                 ctx.CurrentPath = null;
+                ctx.CurrentImage = null;
                 ctx.NextPath = null;
                 ctx.NextImage = null;
+                ctx.PreloadTask = null;
                 ctx.IsAdvancing = false;
-                ctx.IsPreloading = false;
                 ctx.History.Clear();
             }
         }
@@ -1016,7 +1080,7 @@ namespace RandomMediaPlayer
                 else if (!string.IsNullOrEmpty(_currentMediaPath) && ctx.Window != null)
                 {
                     // Sync: push the current global pick.
-                    await ShowOnContextAsync(ctx, _currentMediaPath!, _nextImageBuffer, _currentMediaKind);
+                    await ShowOnContextAsync(ctx, _currentMediaPath!, _currentImage, _currentMediaKind);
                 }
             }
             catch (Exception ex)
@@ -1079,7 +1143,7 @@ namespace RandomMediaPlayer
             }
             else
             {
-                _mediaFiles.Clear();
+                ResetMediaList();
                 FileEnumerationProgressBar.Value = 0;
                 ProgressLabel.Content = "No folders selected";
             }
@@ -1088,7 +1152,7 @@ namespace RandomMediaPlayer
         private void ClearFoldersButton_Click(object sender, RoutedEventArgs e)
         {
             _selectedFolders.Clear();
-            _mediaFiles.Clear();
+            ResetMediaList();
             UpdateFolderDisplay();
             FileEnumerationProgressBar.Value = 0;
             ProgressLabel.Content = "No folders selected";
@@ -1162,9 +1226,7 @@ namespace RandomMediaPlayer
             var collected = new List<string>();
             try
             {
-                _mediaFiles.Clear();
-                _nextImageBuffer = null;
-                _nextMediaPath = null;
+                ResetMediaList();
 
                 await Task.Run(() => EnumerateMultipleFolders(_selectedFolders, extensions, collected, progress, ct), ct);
 
@@ -1172,9 +1234,9 @@ namespace RandomMediaPlayer
                 // will overwrite anyway.
                 if (ct.IsCancellationRequested) return;
 
-                // Bulk-append on the UI thread once enumeration is done.
-                foreach (var f in collected)
-                    _mediaFiles.Add(f);
+                // The worker is done with the list, so adopt it as-is rather
+                // than copying every entry one at a time.
+                _mediaFiles = collected;
             }
             catch (OperationCanceledException)
             {
@@ -1201,8 +1263,24 @@ namespace RandomMediaPlayer
                     if (_mediaFiles.Count == 0)
                         MessageBox.Show("No media found in the selected folders.");
                     else
-                        await PreloadNextAsync();
+                        _ = StartPreload();
                 }
+            }
+        }
+
+        // Empties the working file list plus everything derived from it
+        // (probe cache, pending picks). Used before every rescan.
+        private void ResetMediaList()
+        {
+            _filterGeneration++; // any pick in flight against the old list is stale
+            _mediaFiles = new List<string>();
+            _probeCache.Clear();
+            _nextImageBuffer = null;
+            _nextMediaPath = null;
+            foreach (var ctx in _monitorContexts)
+            {
+                ctx.NextPath = null;
+                ctx.NextImage = null;
             }
         }
 
@@ -1431,15 +1509,17 @@ namespace RandomMediaPlayer
                 else
                 {
                     // Sync mode (or no monitors selected): one global pick.
-                    if (string.IsNullOrEmpty(_nextMediaPath)) await PreloadNextAsync();
+                    await EnsureNextPickedAsync();
                     if (string.IsNullOrEmpty(_nextMediaPath)) return;
 
                     if (_currentMediaPath != null) PushHistory(_currentMediaPath);
 
-                    var path = _nextMediaPath!;
-                    await ShowMediaAsync(path, _nextImageBuffer);
+                    var (path, image) = TakeNextPick();
+                    await ShowMediaAsync(path, image);
 
-                    await PreloadNextAsync();
+                    // Kick the next preload but don't wait for it - it runs
+                    // during the display interval, not before the timer restarts.
+                    _ = StartPreload();
                 }
             }
             catch (Exception ex)
@@ -1463,8 +1543,7 @@ namespace RandomMediaPlayer
             ctx.IsAdvancing = true;
             try
             {
-                if (string.IsNullOrEmpty(ctx.NextPath))
-                    await PreloadForContextAsync(ctx);
+                await EnsureContextPickedAsync(ctx);
                 if (string.IsNullOrEmpty(ctx.NextPath)) return;
 
                 // Push the OLD current onto this context's own history before
@@ -1474,13 +1553,16 @@ namespace RandomMediaPlayer
                 if (ctx.CurrentPath != null) PushContextHistory(ctx, ctx.CurrentPath);
 
                 var path = ctx.NextPath!;
+                var image = ctx.NextImage;
+                ctx.NextPath = null;
+                ctx.NextImage = null;
                 var kind = ClassifyMedia(path);
 
-                await ShowOnContextAsync(ctx, path, ctx.NextImage, kind);
+                await ShowOnContextAsync(ctx, path, image, kind);
 
-                // Preload the next candidate for this context so timer-driven
-                // advances stay smooth.
-                await PreloadForContextAsync(ctx);
+                // Preload the next candidate for this context in the
+                // background so timer-driven advances stay smooth.
+                _ = StartContextPreload(ctx);
             }
             catch (Exception ex)
             {
@@ -1507,6 +1589,17 @@ namespace RandomMediaPlayer
             string path = ctx.CurrentPath;
             MediaKind kind = ctx.CurrentKind;
 
+            // The monitor already holds the decoded bitmap it is showing;
+            // reuse it rather than decoding the file a second time. (Falls
+            // back to a background load for history items, which carry no
+            // buffered image.)
+            BitmapSource? bmp = null;
+            if (kind == MediaKind.Image)
+            {
+                bmp = ctx.CurrentImage ?? await LoadDisplayBitmapAsync(path);
+                if (bmp == null) return;
+            }
+
             await Dispatcher.InvokeAsync(() =>
             {
                 StopPreviewOfOtherKinds(kind);
@@ -1514,13 +1607,6 @@ namespace RandomMediaPlayer
 
                 if (kind == MediaKind.Image)
                 {
-                    var bmp = ctx.NextImage; // may be null if already advanced
-                    if (bmp == null)
-                    {
-                        var loaded = TryLoadBitmap(path);
-                        if (loaded == null) return;
-                        bmp = ApplyRotationIfNeeded(loaded, path);
-                    }
                     ShowOnly(PreviewImage);
                     PreviewImage.Stretch = scaleToFill ? Stretch.UniformToFill : Stretch.Uniform;
                     PreviewImage.Source = bmp;
@@ -1554,7 +1640,7 @@ namespace RandomMediaPlayer
 
         // Core media-display routine. Handles the kind-switch + playback.
         // Used by AdvanceToNextMedia, NextRandomAsync, PreviousAsync, delete flow.
-        private async Task ShowMediaAsync(string path, BitmapImage? bufferedImage)
+        private async Task ShowMediaAsync(string path, BitmapSource? bufferedImage)
         {
             var kind = ClassifyMedia(path);
 
@@ -1564,9 +1650,14 @@ namespace RandomMediaPlayer
             _currentMediaKind = kind;
 
             if (kind == MediaKind.Image)
-                await DisplayImageAsync(path, bufferedImage);
+            {
+                _currentImage = await DisplayImageAsync(path, bufferedImage);
+            }
             else
+            {
+                _currentImage = null;
                 await PlayVideoOrGifAsync(path, kind);
+            }
 
             _currentMediaPath = path;
             UpdateFilePathDisplay(path);
@@ -1624,15 +1715,15 @@ namespace RandomMediaPlayer
                 {
                     // Sync mode: one global pick shown on main + every selected
                     // monitor (or just main if none are selected).
-                    if (_currentMediaPath != null) PushHistory(_currentMediaPath);
-
-                    if (string.IsNullOrEmpty(_nextMediaPath))
-                        await PreloadNextAsync();
+                    await EnsureNextPickedAsync();
                     if (string.IsNullOrEmpty(_nextMediaPath)) return;
 
-                    await ShowMediaAsync(_nextMediaPath, _nextImageBuffer);
+                    if (_currentMediaPath != null) PushHistory(_currentMediaPath);
 
-                    await PreloadNextAsync();
+                    var (path, image) = TakeNextPick();
+                    await ShowMediaAsync(path, image);
+
+                    _ = StartPreload();
                 }
             }
             finally
@@ -1697,49 +1788,226 @@ namespace RandomMediaPlayer
             }
         }
 
-        // ---------- Preloading ----------
-        // Worker-thread random-pick filtered by an orientation. Used by both
-        // the global preload (sync mode) and per-context preload (independent).
-        private async Task<(string? path, BitmapImage? image)> PickRandomMediaAsync(string orientation)
+        // ---------- Media probing ----------
+        // Cheap per-file metadata. For images this comes from the container
+        // header only (no pixel decode); for videos from one MediaInfo parse.
+        // Width == 0 marks a file that failed to probe.
+        private readonly record struct MediaProbe(int Width, int Height, int RotationDegrees, long DurationMs)
         {
-            return await Task.Run<(string?, BitmapImage?)>(() =>
-            {
-                int safety = 0;
-                while (safety++ < 200)
-                {
-                    var candidate = GetRandomMedia();
-                    if (candidate == null) return (null, null);
+            public bool IsValid => Width > 0 && Height > 0;
+            // Dimensions as they will appear on screen (EXIF rotation applied).
+            public int OrientedWidth  => RotationDegrees is 90 or 270 ? Height : Width;
+            public int OrientedHeight => RotationDegrees is 90 or 270 ? Width  : Height;
+        }
 
-                    var kind = ClassifyMedia(candidate);
-                    if (kind == MediaKind.Image)
+        private MediaProbe? ProbeMedia(string path, MediaKind kind)
+        {
+            if (_probeCache.TryGetValue(path, out var cached))
+                return cached.IsValid ? cached : null;
+
+            var probe = kind == MediaKind.Video ? ProbeVideo(path) : ProbeImage(path);
+            // Cache misses too (as default) so a corrupt / unsupported file is
+            // rejected instantly on every later pick instead of re-opened.
+            _probeCache[path] = probe ?? default;
+            return probe;
+        }
+
+        // Header-only read: BitmapCacheOption.None makes WIC parse just the
+        // frame header (and EXIF block) - pixels are never decoded. Orders of
+        // magnitude cheaper than loading the image to measure it.
+        private static MediaProbe? ProbeImage(string path)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16);
+                var decoder = BitmapDecoder.Create(fs, BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None);
+                if (decoder.Frames.Count == 0) return null;
+                var frame = decoder.Frames[0];
+                int w = frame.PixelWidth, h = frame.PixelHeight;
+                if (w <= 0 || h <= 0) return null;
+                return new MediaProbe(w, h, ReadExifRotation(frame), 0);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Image probe failed for {path}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static MediaProbe? ProbeVideo(string path)
+        {
+            try
+            {
+                var info = new MediaInfoWrapper(path, NullLogger<MediaInfoWrapper>.Instance);
+                int w = info.Width, h = info.Height;
+                if (w <= 0 || h <= 0) return null;
+                return new MediaProbe(w, h, 0, info.Duration);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MediaInfo failed for {path}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static int ReadExifRotation(BitmapFrame frame)
+        {
+            try
+            {
+                if (frame.Metadata is BitmapMetadata md
+                    && md.ContainsQuery("System.Photo.Orientation")
+                    && md.GetQuery("System.Photo.Orientation") is ushort orientation)
+                {
+                    return orientation switch
                     {
-                        var bmp = TryLoadBitmap(candidate);
-                        if (bmp == null) continue;
-                        var rotated = ApplyRotationIfNeeded(bmp, candidate);
-                        if (!ImagePassesSize(rotated)) continue;
-                        if (!ImagePassesOrientation(rotated, orientation)) continue;
-                        return (candidate, rotated);
-                    }
-                    else if (kind == MediaKind.Video)
+                        6 => 90,
+                        3 => 180,
+                        8 => 270,
+                        _ => 0
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Rotation check failed: {ex.Message}");
+            }
+            return 0;
+        }
+
+        // ---------- Filters ----------
+        // Snapshot of every dimension-based filter, captured on the UI thread
+        // so the worker-thread pick loop never touches a control.
+        private sealed record PickFilter(string Orientation, int MinWidth, int MinHeight,
+                                         bool NoUpscale, bool ScaleToFill,
+                                         IReadOnlyList<(int W, int H)> Targets)
+        {
+            // w/h are the on-screen (rotation-applied) pixel dimensions.
+            public bool Passes(int w, int h)
+            {
+                if (w < MinWidth || h < MinHeight) return false;
+
+                switch (Orientation)
+                {
+                    case "Landscape": if (w <= h) return false; break;
+                    case "Vertical":  if (h <= w) return false; break;
+                }
+
+                if (NoUpscale)
+                {
+                    foreach (var (tw, th) in Targets)
                     {
-                        if (!VideoPassesFilters(candidate, orientation)) continue;
-                        return (candidate, null);
-                    }
-                    else // Gif (only when classified as Gif by the active mode)
-                    {
-                        // The first frame's pixel dimensions match the animation's
-                        // dimensions, so a static BitmapImage is enough to apply
-                        // both filters. We don't keep the bitmap - VLC will play
-                        // the file directly.
-                        var bmp = TryLoadBitmap(candidate);
-                        if (bmp == null) continue;
-                        if (!ImagePassesSize(bmp)) continue;
-                        if (!ImagePassesOrientation(bmp, orientation)) continue;
-                        return (candidate, null);
+                        // Uniform (fit) scales by min(tw/w, th/h): that exceeds
+                        // 1 only when the file is short in BOTH dimensions.
+                        // UniformToFill scales by max(...): short in EITHER
+                        // dimension means it gets stretched.
+                        bool upscaled = ScaleToFill ? (w < tw || h < th)
+                                                    : (w < tw && h < th);
+                        if (upscaled) return false;
                     }
                 }
+                return true;
+            }
+        }
+
+        // ctx == null -> global pick (sync mode / preview). The no-upscale
+        // targets are then every selected monitor (the pick is shown on all
+        // of them), or the screen under this window when none is selected.
+        private PickFilter BuildPickFilter(string orientation, MonitorContext? ctx)
+        {
+            var targets = new List<(int W, int H)>();
+            if (_noUpscale)
+            {
+                if (ctx != null)
+                {
+                    targets.Add(ScreenPixels(ctx.Screen));
+                }
+                else
+                {
+                    foreach (var c in _monitorContexts.Where(c => c.Selected))
+                        targets.Add(ScreenPixels(c.Screen));
+                    if (targets.Count == 0)
+                    {
+                        var here = ScreenForMainWindow();
+                        if (here != null) targets.Add(ScreenPixels(here));
+                    }
+                }
+            }
+            return new PickFilter(orientation, _minWidth, _minHeight, _noUpscale,
+                                  ScaleToFillCheckBox.IsChecked == true, targets);
+        }
+
+        private static (int W, int H) ScreenPixels(Screen s) =>
+            ((int)s.Bounds.Width, (int)s.Bounds.Height);
+
+        private Screen? ScreenForMainWindow()
+        {
+            try { return Screen.FromWindow(this); }
+            catch { return _monitors.FirstOrDefault(m => m.Primary) ?? _monitors.FirstOrDefault(); }
+        }
+
+        // ---------- Preloading ----------
+        // Upper bound on random draws per pick. Probes are header-only and
+        // cached, so a miss costs microseconds after the first visit.
+        private const int MaxPickAttempts = 400;
+
+        // Worker-thread random pick. Cheap header probe first; the full
+        // (downscaled, rotated) decode only happens for the one candidate that
+        // passes every filter.
+        private Task<(string? path, BitmapSource? image)> PickRandomMediaAsync(PickFilter filter)
+        {
+            var files = _mediaFiles; // immutable snapshot
+            return Task.Run<(string?, BitmapSource?)>(() =>
+            {
+                if (files.Count == 0) return (null, null);
+                var rng = Random.Shared; // thread-safe, unlike a shared System.Random
+
+                for (int attempt = 0; attempt < MaxPickAttempts; attempt++)
+                {
+                    var candidate = files[rng.Next(files.Count)];
+                    var kind = ClassifyMedia(candidate);
+
+                    if (ProbeMedia(candidate, kind) is not { } probe) continue;
+                    if (!filter.Passes(probe.OrientedWidth, probe.OrientedHeight)) continue;
+
+                    // Videos and gifs play straight from disk via VLC.
+                    if (kind != MediaKind.Image) return (candidate, null);
+
+                    var image = LoadDisplayBitmap(candidate, probe);
+                    if (image == null) continue;
+                    return (candidate, image);
+                }
+
+                Debug.WriteLine($"[Pick] No candidate passed the filters in {MaxPickAttempts} attempts.");
                 return (null, null);
             });
+        }
+
+        // Starts a global preload unless one is already in flight, and
+        // remembers the task so advances can join it.
+        private Task StartPreload()
+        {
+            var running = _preloadTask;
+            if (running != null && !running.IsCompleted) return running;
+            return _preloadTask = PreloadNextAsync();
+        }
+
+        // Joins the in-flight preload (if any); if that left nothing queued -
+        // e.g. the pick was invalidated by a filter change - runs one more.
+        private async Task EnsureNextPickedAsync()
+        {
+            var running = _preloadTask;
+            if (running != null && !running.IsCompleted) await running;
+            if (string.IsNullOrEmpty(_nextMediaPath)) await StartPreload();
+        }
+
+        // Hands over the queued pick and clears the slot so it can't be shown
+        // twice. Callers check _nextMediaPath first.
+        private (string path, BitmapSource? image) TakeNextPick()
+        {
+            var result = (_nextMediaPath!, _nextImageBuffer);
+            _nextMediaPath = null;
+            _nextImageBuffer = null;
+            return result;
         }
 
         // Global preload (sync mode + main preview). Uses the default
@@ -1749,12 +2017,19 @@ namespace RandomMediaPlayer
         // a Visibility swap + resume.
         private async Task PreloadNextAsync()
         {
-            if (_isPreloading) return;
-            _isPreloading = true;
-
             try
             {
-                var (path, image) = await PickRandomMediaAsync(_orientationFilter);
+                string? path;
+                BitmapSource? image;
+                while (true)
+                {
+                    int generation = _filterGeneration;
+                    var filter = BuildPickFilter(_orientationFilter, null);
+                    (path, image) = await PickRandomMediaAsync(filter);
+                    // Filters / file list changed while we were picking: the
+                    // result no longer reflects what the user asked for. Redo.
+                    if (generation == _filterGeneration) break;
+                }
                 _nextMediaPath = path;
                 _nextImageBuffer = image;
 
@@ -1767,68 +2042,103 @@ namespace RandomMediaPlayer
                             ctx.Window!.PreloadMedia(path, kind);
                     }
                 }
+                else
+                {
+                    ReportNoCandidates();
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Preload error: {ex.Message}");
             }
-            finally
-            {
-                _isPreloading = false;
-            }
+        }
+
+        private Task StartContextPreload(MonitorContext ctx)
+        {
+            var running = ctx.PreloadTask;
+            if (running != null && !running.IsCompleted) return running;
+            return ctx.PreloadTask = PreloadForContextAsync(ctx);
+        }
+
+        private async Task EnsureContextPickedAsync(MonitorContext ctx)
+        {
+            var running = ctx.PreloadTask;
+            if (running != null && !running.IsCompleted) await running;
+            if (string.IsNullOrEmpty(ctx.NextPath)) await StartContextPreload(ctx);
         }
 
         // Per-monitor preload for independent mode. Each monitor uses its own
-        // orientation filter; "All" falls back to the default. Video / gif
-        // picks are also pushed into this monitor's ping-pong VLC.
+        // orientation filter and its own screen as the no-upscale target.
+        // Video / gif picks are also pushed into this monitor's ping-pong VLC.
         private async Task PreloadForContextAsync(MonitorContext ctx)
         {
-            if (ctx.IsPreloading) return;
-            ctx.IsPreloading = true;
-
             try
             {
-                string orientation = ctx.OrientationFilter == "All" ? "All" : ctx.OrientationFilter;
-                var (path, image) = await PickRandomMediaAsync(orientation);
+                string? path;
+                BitmapSource? image;
+                while (true)
+                {
+                    int generation = _filterGeneration;
+                    var filter = BuildPickFilter(ctx.OrientationFilter, ctx);
+                    (path, image) = await PickRandomMediaAsync(filter);
+                    if (generation == _filterGeneration) break; // stale, redo
+                }
                 ctx.NextPath = path;
                 ctx.NextImage = image;
 
-                if (!string.IsNullOrEmpty(path) && ctx.Window != null)
+                if (!string.IsNullOrEmpty(path))
                 {
-                    var kind = ClassifyMedia(path);
-                    if (kind != MediaKind.Image)
-                        ctx.Window.PreloadMedia(path, kind);
+                    if (ctx.Window != null)
+                    {
+                        var kind = ClassifyMedia(path);
+                        if (kind != MediaKind.Image)
+                            ctx.Window.PreloadMedia(path, kind);
+                    }
+                }
+                else
+                {
+                    ReportNoCandidates();
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"[{ctx.Screen.DeviceName}] Preload error: {ex.Message}");
             }
-            finally
-            {
-                ctx.IsPreloading = false;
-            }
         }
 
-        private string? GetRandomMedia()
+        // Surfaces an otherwise-silent "slideshow shows nothing" state: files
+        // were found, but none survived the active filters.
+        private void ReportNoCandidates()
         {
-            if (_mediaFiles.Count == 0) return null;
-            return _mediaFiles[_random.Next(_mediaFiles.Count)];
+            if (_mediaFiles.Count == 0) return;
+            ProgressLabel.Content =
+                $"No file out of {_mediaFiles.Count} passed the active filters (min size / orientation / never upscale). Loosen a filter.";
         }
 
-        // ---------- Image loading + rotation ----------
-        private static BitmapImage? TryLoadBitmap(string path)
+        // ---------- Image loading ----------
+        // Full decode of a file that already passed the filters. Decodes at
+        // most to the largest monitor's size and applies the EXIF rotation as
+        // a frozen TransformedBitmap - no PNG re-encode round-trip.
+        private BitmapSource? LoadDisplayBitmap(string path, MediaProbe probe)
         {
             try
             {
+                // A stream (not a Uri) so paths containing '#' or '%' load fine.
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16);
                 var bmp = new BitmapImage();
                 bmp.BeginInit();
-                bmp.UriSource = new Uri(path, UriKind.Absolute);
+                bmp.StreamSource = fs;
                 bmp.CacheOption = BitmapCacheOption.OnLoad;
                 bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                int decodeWidth = DecodeWidthFor(probe);
+                if (decodeWidth > 0) bmp.DecodePixelWidth = decodeWidth;
                 bmp.EndInit();
                 bmp.Freeze();
-                return bmp;
+
+                if (probe.RotationDegrees == 0) return bmp;
+                var rotated = new TransformedBitmap(bmp, new RotateTransform(probe.RotationDegrees));
+                rotated.Freeze();
+                return rotated;
             }
             catch (Exception ex)
             {
@@ -1837,100 +2147,36 @@ namespace RandomMediaPlayer
             }
         }
 
-        private static BitmapImage ApplyRotationIfNeeded(BitmapImage image, string path)
+        // Fresh load for a path with no buffered bitmap (history navigation).
+        private BitmapSource? LoadDisplayBitmap(string path) =>
+            ProbeMedia(path, MediaKind.Image) is { } probe ? LoadDisplayBitmap(path, probe) : null;
+
+        private Task<BitmapSource?> LoadDisplayBitmapAsync(string path) =>
+            Task.Run(() => LoadDisplayBitmap(path));
+
+        // Decode width (in the file's native orientation) that still covers
+        // the largest monitor under Scale-to-Fill - the more demanding of the
+        // two stretch modes, so switching modes later never lacks pixels.
+        // 0 = decode at native size.
+        private int DecodeWidthFor(MediaProbe probe)
         {
-            try
-            {
-                var frame = BitmapFrame.Create(new Uri(path, UriKind.Absolute),
-                                               BitmapCreateOptions.DelayCreation,
-                                               BitmapCacheOption.OnLoad);
-                if (frame.Metadata is BitmapMetadata md && md.ContainsQuery("System.Photo.Orientation"))
-                {
-                    if (md.GetQuery("System.Photo.Orientation") is ushort orientation)
-                    {
-                        int angle = orientation switch
-                        {
-                            6 => 90,
-                            3 => 180,
-                            8 => 270,
-                            _ => 0
-                        };
-                        if (angle != 0)
-                            return EncodeBitmap(new TransformedBitmap(frame, new RotateTransform(angle)));
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Rotation check failed: {ex.Message}");
-            }
-            return image;
-        }
-
-        private static BitmapImage EncodeBitmap(BitmapSource source)
-        {
-            var bi = new BitmapImage();
-            using var ms = new MemoryStream();
-            BitmapEncoder encoder = new PngBitmapEncoder();
-            encoder.Frames.Add(BitmapFrame.Create(source));
-            encoder.Save(ms);
-            ms.Position = 0;
-            bi.BeginInit();
-            bi.CacheOption = BitmapCacheOption.OnLoad;
-            bi.StreamSource = ms;
-            bi.EndInit();
-            bi.Freeze();
-            return bi;
-        }
-
-        // ---------- Filters ----------
-        // Orientation parameter so the same filter logic works for the global
-        // pick (uses _orientationFilter) and for per-monitor independent picks
-        // (each monitor passes its own).
-        private static bool ImagePassesOrientation(BitmapImage bmp, string orientation)
-        {
-            if (orientation == "All") return true;
-            bool isLandscape = bmp.PixelWidth > bmp.PixelHeight;
-            bool isPortrait = bmp.PixelHeight > bmp.PixelWidth;
-            return (orientation == "Landscape" && isLandscape)
-                || (orientation == "Vertical"  && isPortrait);
-        }
-
-        // Min-size filter applied to images and gifs. The same _minWidth /
-        // _minHeight values feed VideoPassesFilters too, so the field in the
-        // UI is a single "min size" knob that covers every media kind.
-        private bool ImagePassesSize(BitmapImage bmp) =>
-            bmp.PixelWidth >= _minWidth && bmp.PixelHeight >= _minHeight;
-
-        private bool VideoPassesFilters(string path, string orientation)
-        {
-            try
-            {
-                var info = new MediaInfoWrapper(path, NullLogger<MediaInfoWrapper>.Instance);
-                int w = info.Width, h = info.Height;
-
-                if (w < _minWidth || h < _minHeight) return false;
-
-                return orientation switch
-                {
-                    "Landscape" => w > h,
-                    "Vertical"  => h > w,
-                    _ => true
-                };
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"MediaInfo failed for {path}: {ex.Message}");
-                return false;
-            }
+            if (_decodeCapW <= 0 || _decodeCapH <= 0) return 0;
+            double scale = Math.Max((double)_decodeCapW / probe.OrientedWidth,
+                                    (double)_decodeCapH / probe.OrientedHeight);
+            if (scale >= 1) return 0;
+            return Math.Max(1, (int)Math.Ceiling(probe.Width * scale));
         }
 
         // ---------- Display image (sync mode entry point) ----------
-        private async Task DisplayImageAsync(string path, BitmapImage? image)
+        // `image` (when supplied by the preloader) is already decoded and
+        // EXIF-rotated - it must NOT be rotated again here. Only a history
+        // item (no buffer) is loaded fresh, off the UI thread.
+        // Returns the bitmap that was put on screen (null if it failed to load).
+        private async Task<BitmapSource?> DisplayImageAsync(string path, BitmapSource? image)
         {
-            image ??= TryLoadBitmap(path);
-            if (image == null) return;
-            var rotated = ApplyRotationIfNeeded(image, path);
+            image ??= await LoadDisplayBitmapAsync(path);
+            if (image == null) return null;
+            var rotated = image;
 
             await Dispatcher.InvokeAsync(() =>
             {
@@ -1951,6 +2197,7 @@ namespace RandomMediaPlayer
                     ctx.Window!.SetPathOverlay(path, showOverlay);
                 }
             });
+            return rotated;
         }
 
         // libvlc's built-in gif demuxer treats the file as a single still
@@ -2016,24 +2263,26 @@ namespace RandomMediaPlayer
             double clipMs = (double.TryParse(DelayTextBox.Text, out var d) && d > 0 ? d : 10) * 1000;
             int startTimeMs = 0;
 
-            if (kind == MediaKind.Video && !GifExtensions.Contains(Path.GetExtension(path))
+            if (kind == MediaKind.Video
                 && !string.Equals(Path.GetExtension(path), ".webm", StringComparison.OrdinalIgnoreCase))
             {
-                try
+                // Normally a cache hit: the pick loop already probed this file
+                // when it passed the filters, so no MediaInfo parse happens on
+                // the UI thread here.
+                var probe = ProbeMedia(path, MediaKind.Video);
+                if (probe is { DurationMs: > 0 } p)
                 {
-                    var info = new MediaInfoWrapper(path, NullLogger<MediaInfoWrapper>.Instance);
-                    long duration = info.Duration;
+                    long duration = p.DurationMs;
                     if (duration > clipMs)
                     {
                         long maxStart = duration - (long)clipMs;
-                        startTimeMs = _random.Next(0, (int)maxStart);
+                        startTimeMs = Random.Shared.Next(0, (int)Math.Min(maxStart, int.MaxValue));
                     }
                     else
                     {
                         clipMs = Math.Max(duration, 1000);
                     }
                 }
-                catch { /* fall back to clipMs default */ }
             }
             return (clipMs, startTimeMs);
         }
@@ -2041,7 +2290,7 @@ namespace RandomMediaPlayer
         // ---------- Independent-mode per-context display ----------
         // Pushes a single piece of media into one specific monitor's window.
         private async Task ShowOnContextAsync(MonitorContext ctx, string path,
-                                              BitmapImage? bufferedImage, MediaKind kind)
+                                              BitmapSource? bufferedImage, MediaKind kind)
         {
             if (ctx.Window == null) return;
 
@@ -2050,18 +2299,20 @@ namespace RandomMediaPlayer
             ctx.Window.StopPlaybackOfOtherKinds(kind);
             ctx.CurrentKind = kind;
             ctx.CurrentPath = path;
+            ctx.CurrentImage = null;
 
             bool scaleToFill = ScaleToFillCheckBox.IsChecked == true;
             bool showOverlay = ShowPathOverlayCheckBox.IsChecked == true;
 
             if (kind == MediaKind.Image)
             {
-                var bmp = bufferedImage ?? TryLoadBitmap(path);
+                // Buffered images are already rotated by the preloader.
+                var bmp = bufferedImage ?? await LoadDisplayBitmapAsync(path);
                 if (bmp == null) return;
-                var rotated = ApplyRotationIfNeeded(bmp, path);
+                ctx.CurrentImage = bmp;
                 await Dispatcher.InvokeAsync(() =>
                 {
-                    ctx.Window?.DisplayImage(rotated, scaleToFill);
+                    ctx.Window?.DisplayImage(bmp, scaleToFill);
                     ctx.Window?.SetPathOverlay(path, showOverlay);
                 });
             }
@@ -2235,7 +2486,11 @@ namespace RandomMediaPlayer
             }
 
             // Drop from the working list so it can't be re-randomly-picked.
-            _mediaFiles.Remove(toDelete);
+            // Copy-on-write: a worker pick loop may be indexing the old list.
+            var remaining = new List<string>(_mediaFiles);
+            remaining.Remove(toDelete);
+            _mediaFiles = remaining;
+            _probeCache.TryRemove(toDelete, out _);
             // Drop from history too.
             _history.RemoveAll(p => string.Equals(p, toDelete, StringComparison.OrdinalIgnoreCase));
 
@@ -2294,6 +2549,8 @@ namespace RandomMediaPlayer
             MinHeightTextBox.Text = s.MinHeight.ToString();
             _minWidth = s.MinWidth;
             _minHeight = s.MinHeight;
+            NoUpscaleCheckBox.IsChecked = s.NoUpscale;
+            _noUpscale = s.NoUpscale;
 
             AlwaysOnTopCheckBox.IsChecked = s.AlwaysOnTop;
             this.Topmost = s.AlwaysOnTop;
@@ -2389,6 +2646,7 @@ namespace RandomMediaPlayer
                     DelaySeconds = double.TryParse(DelayTextBox.Text, out var d) ? d : 3,
                     MinWidth = _minWidth,
                     MinHeight = _minHeight,
+                    NoUpscale = _noUpscale,
                     AlwaysOnTop = AlwaysOnTopCheckBox.IsChecked == true,
                     ScaleToFill = ScaleToFillCheckBox.IsChecked == true,
                     Mute = MuteCheckBox.IsChecked == true,

@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using System.Windows.Media.Imaging;
 using WpfScreenHelper;
 
@@ -45,8 +46,15 @@ namespace RandomMediaPlayer
         public FullscreenSlideshowWindow? Window { get; set; }
         public string? CurrentPath { get; set; }
         public MediaKind CurrentKind { get; set; } = MediaKind.Image;
+        // Decoded, EXIF-rotated bitmap currently on screen (images only). The
+        // main preview mirrors this in independent mode so it never has to
+        // re-decode - and never shows the *next* pick by mistake.
+        public BitmapSource? CurrentImage { get; set; }
         public string? NextPath { get; set; }
-        public BitmapImage? NextImage { get; set; }
+        public BitmapSource? NextImage { get; set; }
+        // In-flight preload for this context. Advances await it instead of
+        // re-picking, so preloading overlaps the display interval.
+        public Task? PreloadTask { get; set; }
 
         // Per-monitor playback history for left-arrow back navigation in
         // independent mode. Capped externally by MainWindow.MaxHistory.
@@ -55,7 +63,6 @@ namespace RandomMediaPlayer
         // Used to gate per-context advances (independent mode) so a tick can't
         // re-enter while a previous one is still in flight on the same context.
         public bool IsAdvancing { get; set; }
-        public bool IsPreloading { get; set; }
 
         public MonitorContext(int index, Screen screen)
         {

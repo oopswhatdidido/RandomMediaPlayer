@@ -88,7 +88,7 @@ namespace RandomMediaPlayer
             }
         }
 
-        public void DisplayImage(BitmapImage image, bool scaleToFill)
+        public void DisplayImage(BitmapSource image, bool scaleToFill)
         {
             // Coming from VLC -> stop the source we're leaving.
             PauseActiveVlcSafely();

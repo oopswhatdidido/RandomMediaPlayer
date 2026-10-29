@@ -21,7 +21,7 @@
             <!-- Progress -->
             <RowDefinition Height="Auto"/>
             <!-- Settings tabs -->
-            <RowDefinition Height="280"/>
+            <RowDefinition Height="310"/>
             <!-- File path -->
             <RowDefinition Height="Auto"/>
             <!-- Preview (fills) -->
@@ -226,7 +226,9 @@
                                   Checked="AlwaysOnTopCheckBox_Changed"
                                   Unchecked="AlwaysOnTopCheckBox_Changed"/>
                         <CheckBox x:Name="ScaleToFillCheckBox" Content="Scale to Fill"
-                                  Margin="0,4,20,4"/>
+                                  Margin="0,4,20,4"
+                                  Checked="ScaleToFillCheckBox_Changed"
+                                  Unchecked="ScaleToFillCheckBox_Changed"/>
                         <CheckBox x:Name="MuteCheckBox" Content="Mute (videos)"
                                   IsChecked="True"
                                   Margin="0,4,20,4"/>
@@ -262,6 +264,18 @@
                                  TextChanged="MinSizeTextBox_TextChanged"
                                  VerticalContentAlignment="Center"/>
                         <TextBlock Text="(filters photos, gifs, and videos by minimum pixel dimensions)"
+                                   Opacity="0.65" FontStyle="Italic"
+                                   Margin="12,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,4,0,4">
+                        <CheckBox x:Name="NoUpscaleCheckBox"
+                                  Content="Never upscale"
+                                  VerticalAlignment="Center"
+                                  Checked="NoUpscaleCheckBox_Changed"
+                                  Unchecked="NoUpscaleCheckBox_Changed"
+                                  ToolTip="Skips any photo, gif, or video whose pixel dimensions are smaller than the monitor it will be shown on. With 'Scale to Fill' off, a file is skipped only when it is smaller in BOTH width and height (it would otherwise be shown at native size or smaller). With 'Scale to Fill' on, a file must be at least the monitor's size in both dimensions. In sync mode the check is made against every selected monitor; with no monitor selected it uses the screen this window is on."/>
+                        <TextBlock Text="(skips media smaller than the target monitor's resolution - it would otherwise be stretched up)"
                                    Opacity="0.65" FontStyle="Italic"
                                    Margin="12,0,0,0" VerticalAlignment="Center"/>
                     </StackPanel>

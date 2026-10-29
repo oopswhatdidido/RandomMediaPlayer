@@ -31,7 +31,8 @@ Uses eager `Directory.GetFiles` / `Directory.GetDirectories` with separate per-s
 
 ### Filters
 - **Orientation**: All / Landscape / Vertical (works for both photos and videos)
-- **Min size** (W × H) for videos — filters out clips below the chosen pixel dimensions
+- **Min size** (W × H) — filters out photos, gifs, and videos below the chosen pixel dimensions
+- **Never upscale** — skips anything whose pixel dimensions are smaller than the monitor it will be shown on, so nothing is ever stretched up. The rule follows the stretch mode: with *Scale to Fill* off, a file is skipped only when it is smaller in **both** width and height (otherwise it displays at native size or smaller); with *Scale to Fill* on, it must be at least the monitor's size in both dimensions. Sync mode checks against every selected monitor; independent mode checks each monitor's own resolution; with no monitor selected, the screen the main window is on is used. EXIF rotation is applied before the check.
 - **Mute** for video playback
 - **Always on top** for both windows
 - **Scale to Fill** vs. uniform fit
@@ -87,7 +88,7 @@ User preferences are persisted to `%APPDATA%\RandomMediaPlayer\settings.json` on
 
 What's saved:
 - Mode, orientation filter, animated-include toggle
-- Display time / clip length, min-size for videos
+- Display time / clip length, min-size, never-upscale flag
 - Always-on-top, scale-to-fill, mute
 - Selected monitor (matched by device name; falls back to None if the saved monitor disappears)
 - Panic combo (key + modifiers + action)
@@ -146,6 +147,13 @@ RandomMediaPlayer/
 - `.webm` and other video extensions → `MediaKind.Video` (always plays via VLC)
 - `.gif` / `.jfif` / `.gifv` / `.apng` → `MediaKind.Image` in Photo mode (static first frame), `MediaKind.Gif` in Video / Mixed mode (animated via `MediaElement`)
 - Everything else → `MediaKind.Image`
+
+### Picking and preloading
+The random pick runs on a worker thread. Each candidate is first **probed** cheaply: images via a header-only WIC decode (`BitmapCacheOption.None` — dimensions + EXIF orientation, no pixel decode), videos via one MediaInfo parse. Probe results (including failures) are cached per path for the lifetime of the current file list, so a rejected or broken file costs nothing the next time it is drawn. All dimension filters (min size, orientation, never-upscale) run against the probe; only the single winning image is fully decoded.
+
+That decode is capped with `DecodePixelWidth` to the largest attached monitor (sized for Scale-to-Fill, the more demanding mode), and EXIF rotation is applied as a frozen `TransformedBitmap` — no re-encode. The buffered bitmap is final: display code never rotates it again.
+
+The preload for the *next* item is fire-and-forget; the advance joins the in-flight task instead of re-picking, so the pick overlaps the display interval rather than delaying the timer restart. Changing a filter discards any pending pick and starts a fresh one.
 
 ### Playback transitions and the "freeze on second video" bug
 libvlc's `Stop` synchronously waits for its internal media thread to wind down. Calling `Stop` while `EndReached` is firing deadlocks the UI thread. The current code never calls `Stop` on a player it's about to reuse — `Play(newUri)` handles the transition itself — and it uses `Pause` (not `Stop`) when switching *away* from VLC, since `Pause` doesn't tear down the media thread. EndReached / MediaEnded handlers are gated on `_currentMediaKind` so stale events from a paused-but-still-buffered player can't accidentally trigger an advance.
