@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
@@ -55,6 +55,11 @@ namespace RandomMediaPlayer
         // In-flight preload for this context. Advances await it instead of
         // re-picking, so preloading overlaps the display interval.
         public Task? PreloadTask { get; set; }
+
+        // Stay-in-folder lock for this monitor's own picks (independent mode).
+        // Null = draw from every scanned folder. Set / cleared by the
+        // stay-in-folder hotkeys in MainWindow.
+        public FolderLock? FolderLock { get; set; }
 
         // Per-monitor playback history for left-arrow back navigation in
         // independent mode. Capped externally by MainWindow.MaxHistory.

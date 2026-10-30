@@ -1,4 +1,4 @@
-using MediaInfo;
+﻿using MediaInfo;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ookii.Dialogs.Wpf;
 using System;
@@ -189,9 +189,13 @@ namespace RandomMediaPlayer
         // need the snapshots to stay coherent with the latest UI selection.
         private bool _panicCtrlSnap, _panicAltSnap;
         private bool _holdCtrlSnap,  _holdAltSnap;
+        private bool _folderLockCtrlSnap, _folderLockAltSnap;
+        private bool _focusFolderLockCtrlSnap, _focusFolderLockAltSnap;
 
         private const int PANIC_HOTKEY_ID = 0x9F37;
         private const int HOLD_HOTKEY_ID  = 0x9F38;
+        private const int FOLDER_LOCK_HOTKEY_ID       = 0x9F39;
+        private const int FOCUS_FOLDER_LOCK_HOTKEY_ID = 0x9F3A;
         private const int WM_HOTKEY = 0x0312;
 
         // RegisterHotKey fsModifiers flags
@@ -212,6 +216,16 @@ namespace RandomMediaPlayer
         // monitor can self-loop in hold mode without us fanning the loop out
         // (which would mis-restart videos on other monitors in independent mode).
         internal bool IsOnHold => _isOnHold;
+
+        // Stay-in-folder hotkeys. _folderLock scopes the global (sync-mode /
+        // preview) pick; each MonitorContext carries its own lock for
+        // independent mode. Null = no lock.
+        private Key _folderLockKey = Key.F8;
+        private bool _folderLockHotkeyRegistered;
+        private Key _focusFolderLockKey = Key.F7;
+        private bool _focusFolderLockHotkeyRegistered;
+        private FolderLock? _folderLock;
+        private bool _folderLockIncludeSubfolders;
 
         // When true, we observe keys via WH_KEYBOARD_LL (works across multiple
         // app instances). When false, we claim them via RegisterHotKey
@@ -248,6 +262,7 @@ namespace RandomMediaPlayer
             LoadMonitors();
             PopulatePanicControls();
             PopulateHoldControls();
+            PopulateFolderLockControls();
 
             // Load persisted settings BEFORE applying UI mode so all controls
             // reflect saved values. _uiInitialized stays false during this so
@@ -259,6 +274,7 @@ namespace RandomMediaPlayer
 
             ApplyModeUi();
             UpdateHoldStatus();
+            UpdateFolderLockStatus();
 
             // If folder persistence was on and folders were saved, kick off
             // an initial enumeration so the saved list is usable immediately.
@@ -310,14 +326,19 @@ namespace RandomMediaPlayer
             if (_useLowLevelHook)
             {
                 InstallLowLevelHook();
-                // With LL hook there's no claim contention - mark both as Active.
-                SetPanicStatus(_llHookHandle != IntPtr.Zero);
-                SetHoldKeyStatus(_llHookHandle != IntPtr.Zero);
+                // With LL hook there's no claim contention - mark all as Active.
+                bool hooked = _llHookHandle != IntPtr.Zero;
+                SetPanicStatus(hooked);
+                SetHoldKeyStatus(hooked);
+                SetHotkeyStatusText(FolderLockStatusBox, hooked);
+                SetHotkeyStatusText(FocusFolderLockStatusBox, hooked);
             }
             else
             {
                 RegisterPanicHotKey();
                 RegisterHoldHotKey();
+                RegisterFolderLockHotKey();
+                RegisterFocusFolderLockHotKey();
             }
         }
 
@@ -335,6 +356,16 @@ namespace RandomMediaPlayer
                 {
                     UnregisterHotKey(_hwndSource.Handle, HOLD_HOTKEY_ID);
                     _holdHotkeyRegistered = false;
+                }
+                if (_folderLockHotkeyRegistered)
+                {
+                    UnregisterHotKey(_hwndSource.Handle, FOLDER_LOCK_HOTKEY_ID);
+                    _folderLockHotkeyRegistered = false;
+                }
+                if (_focusFolderLockHotkeyRegistered)
+                {
+                    UnregisterHotKey(_hwndSource.Handle, FOCUS_FOLDER_LOCK_HOTKEY_ID);
+                    _focusFolderLockHotkeyRegistered = false;
                 }
             }
         }
@@ -399,6 +430,16 @@ namespace RandomMediaPlayer
                     {
                         Dispatcher.BeginInvoke(ToggleHold);
                     }
+                    if (key == _folderLockKey &&
+                        ctrl == _folderLockCtrlSnap && alt == _folderLockAltSnap && !shift)
+                    {
+                        Dispatcher.BeginInvoke(ToggleFolderLock);
+                    }
+                    if (key == _focusFolderLockKey &&
+                        ctrl == _focusFolderLockCtrlSnap && alt == _focusFolderLockAltSnap && !shift)
+                    {
+                        Dispatcher.BeginInvoke(LockAllToFocusedFolder);
+                    }
                 }
             }
             // Pass through. Returning non-zero would cancel propagation but
@@ -415,6 +456,10 @@ namespace RandomMediaPlayer
             _panicAltSnap  = PanicAltCheckBox?.IsChecked  == true;
             _holdCtrlSnap  = HoldCtrlCheckBox?.IsChecked  == true;
             _holdAltSnap   = HoldAltCheckBox?.IsChecked   == true;
+            _folderLockCtrlSnap = FolderLockCtrlCheckBox?.IsChecked == true;
+            _folderLockAltSnap  = FolderLockAltCheckBox?.IsChecked  == true;
+            _focusFolderLockCtrlSnap = FocusFolderLockCtrlCheckBox?.IsChecked == true;
+            _focusFolderLockAltSnap  = FocusFolderLockAltCheckBox?.IsChecked  == true;
         }
 
         private void MultiInstanceCheckBox_Changed(object sender, RoutedEventArgs e)
@@ -438,6 +483,16 @@ namespace RandomMediaPlayer
                 else if (id == HOLD_HOTKEY_ID)
                 {
                     Dispatcher.BeginInvoke(ToggleHold);
+                    handled = true;
+                }
+                else if (id == FOLDER_LOCK_HOTKEY_ID)
+                {
+                    Dispatcher.BeginInvoke(ToggleFolderLock);
+                    handled = true;
+                }
+                else if (id == FOCUS_FOLDER_LOCK_HOTKEY_ID)
+                {
+                    Dispatcher.BeginInvoke(LockAllToFocusedFolder);
                     handled = true;
                 }
             }
@@ -560,18 +615,21 @@ namespace RandomMediaPlayer
             }
         }
 
-        private void SetHoldKeyStatus(bool registered)
+        private void SetHoldKeyStatus(bool registered) => SetHotkeyStatusText(HoldStatusBox, registered);
+
+        // Shared "✓ Active / ⚠ Unavailable" indicator used by every global hotkey row.
+        private static void SetHotkeyStatusText(TextBlock? box, bool registered)
         {
-            if (HoldStatusBox == null) return;
+            if (box == null) return;
             if (registered)
             {
-                HoldStatusBox.Text = "  ✓ Active";
-                HoldStatusBox.Foreground = new SolidColorBrush(Color.FromRgb(0x6B, 0xCB, 0x77));
+                box.Text = "  ✓ Active";
+                box.Foreground = new SolidColorBrush(Color.FromRgb(0x6B, 0xCB, 0x77));
             }
             else
             {
-                HoldStatusBox.Text = "  ⚠ Unavailable - try Ctrl/Alt or another key";
-                HoldStatusBox.Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xA5, 0x00));
+                box.Text = "  ⚠ Unavailable - try Ctrl/Alt or another key";
+                box.Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xA5, 0x00));
             }
         }
 
@@ -633,20 +691,7 @@ namespace RandomMediaPlayer
             HoldStatusText.Text = _isOnHold ? "⏸ HELD" : "";
         }
 
-        private void SetPanicStatus(bool registered)
-        {
-            if (PanicStatusText == null) return;
-            if (registered)
-            {
-                PanicStatusText.Text = "  ✓ Active";
-                PanicStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x6B, 0xCB, 0x77));
-            }
-            else
-            {
-                PanicStatusText.Text = "  ⚠ Unavailable - try Ctrl/Alt or another key";
-                PanicStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xA5, 0x00));
-            }
-        }
+        private void SetPanicStatus(bool registered) => SetHotkeyStatusText(PanicStatusText, registered);
 
         private void PanicSettingChanged(object sender, RoutedEventArgs e)
         {
@@ -685,6 +730,273 @@ namespace RandomMediaPlayer
                 {
                     RegisterPanicHotKey();
                 }
+            }
+        }
+
+        // ---------- Stay-in-folder keys ----------
+        // Two global hotkeys narrow the random draw to a folder:
+        //  * Stay in Folder (F8) toggles a per-monitor lock. Each monitor keeps
+        //    drawing from the folder of the file it is showing right now - its
+        //    own folder in independent mode, the shared one in sync mode.
+        //  * Stay in Focused Folder (F7) locks every monitor to the folder of
+        //    the file on the focused fullscreen window (or the main window's
+        //    current file). Pressing it again on that same folder releases.
+        // Either key releases a lock set by the other. Locks survive stop /
+        // start and rescans; a lock whose folder no longer yields files just
+        // reports "no candidates" until it is released.
+        private static readonly Key[] FolderLockKeyChoices =
+        {
+            Key.F1, Key.F2, Key.F3, Key.F4, Key.F5, Key.F6,
+            Key.F7, Key.F8, Key.F9, Key.F10, Key.F11, Key.F12,
+            Key.Pause, Key.Scroll
+        };
+
+        private void PopulateFolderLockControls()
+        {
+            var names = FolderLockKeyChoices.Select(k => k.ToString()).ToList();
+            FolderLockKeyComboBox.ItemsSource = names;
+            FolderLockKeyComboBox.SelectedItem = _folderLockKey.ToString();
+            FocusFolderLockKeyComboBox.ItemsSource = new List<string>(names);
+            FocusFolderLockKeyComboBox.SelectedItem = _focusFolderLockKey.ToString();
+        }
+
+        private static string DescribeCombo(bool ctrl, bool alt, Key key)
+        {
+            var parts = new List<string>();
+            if (ctrl) parts.Add("Ctrl");
+            if (alt) parts.Add("Alt");
+            parts.Add(key.ToString());
+            return string.Join("+", parts);
+        }
+
+        // RegisterHotKey wrapper shared by the two stay-in-folder keys.
+        private bool RegisterGlobalHotKey(int id, Key key, bool ctrl, bool alt,
+                                          ref bool registered, string label)
+        {
+            if (_hwndSource == null) return false;
+            var hwnd = _hwndSource.Handle;
+
+            if (registered)
+            {
+                UnregisterHotKey(hwnd, id);
+                registered = false;
+            }
+
+            uint mods = MOD_NOREPEAT;
+            if (ctrl) mods |= MOD_CONTROL;
+            if (alt) mods |= MOD_ALT;
+            uint vk = (uint)KeyInterop.VirtualKeyFromKey(key);
+
+            registered = RegisterHotKey(hwnd, id, mods, vk);
+            Debug.WriteLine(registered
+                ? $"[{label}] Registered hotkey: {DescribeCombo(ctrl, alt, key)}"
+                : $"[{label}] Failed to register {DescribeCombo(ctrl, alt, key)} - claimed by another app.");
+            return registered;
+        }
+
+        private void RegisterFolderLockHotKey()
+        {
+            bool ok = RegisterGlobalHotKey(FOLDER_LOCK_HOTKEY_ID, _folderLockKey,
+                FolderLockCtrlCheckBox?.IsChecked == true, FolderLockAltCheckBox?.IsChecked == true,
+                ref _folderLockHotkeyRegistered, "FolderLock");
+            SetHotkeyStatusText(FolderLockStatusBox, ok);
+        }
+
+        private void RegisterFocusFolderLockHotKey()
+        {
+            bool ok = RegisterGlobalHotKey(FOCUS_FOLDER_LOCK_HOTKEY_ID, _focusFolderLockKey,
+                FocusFolderLockCtrlCheckBox?.IsChecked == true, FocusFolderLockAltCheckBox?.IsChecked == true,
+                ref _focusFolderLockHotkeyRegistered, "FocusFolderLock");
+            SetHotkeyStatusText(FocusFolderLockStatusBox, ok);
+        }
+
+        private void FolderLockSettingChanged(object sender, RoutedEventArgs e)
+        {
+            if (!_uiInitialized) return;
+
+            bool needsReregister = sender == FolderLockCtrlCheckBox || sender == FolderLockAltCheckBox;
+            if (FolderLockKeyComboBox?.SelectedItem is string keyName &&
+                Enum.TryParse<Key>(keyName, out var newKey) && newKey != _folderLockKey)
+            {
+                _folderLockKey = newKey;
+                needsReregister = true;
+            }
+
+            UpdateModifierSnapshots();
+            if (!needsReregister) return;
+
+            if (_useLowLevelHook)
+                SetHotkeyStatusText(FolderLockStatusBox, _llHookHandle != IntPtr.Zero);
+            else
+                RegisterFolderLockHotKey();
+        }
+
+        private void FocusFolderLockSettingChanged(object sender, RoutedEventArgs e)
+        {
+            if (!_uiInitialized) return;
+
+            bool needsReregister = sender == FocusFolderLockCtrlCheckBox || sender == FocusFolderLockAltCheckBox;
+            if (FocusFolderLockKeyComboBox?.SelectedItem is string keyName &&
+                Enum.TryParse<Key>(keyName, out var newKey) && newKey != _focusFolderLockKey)
+            {
+                _focusFolderLockKey = newKey;
+                needsReregister = true;
+            }
+
+            UpdateModifierSnapshots();
+            if (!needsReregister) return;
+
+            if (_useLowLevelHook)
+                SetHotkeyStatusText(FocusFolderLockStatusBox, _llHookHandle != IntPtr.Zero);
+            else
+                RegisterFocusFolderLockHotKey();
+        }
+
+        // Rebuilds any active lock under the new subfolder rule so the toggle
+        // takes effect on the very next pick rather than the next lock.
+        private void FolderLockIncludeSubfoldersCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _folderLockIncludeSubfolders = FolderLockIncludeSubfoldersCheckBox.IsChecked == true;
+            if (!_uiInitialized || !AnyFolderLock()) return;
+
+            bool sub = _folderLockIncludeSubfolders;
+            if (_folderLock != null) _folderLock = new FolderLock(_folderLock.Folder, sub);
+            foreach (var ctx in _monitorContexts)
+                if (ctx.FolderLock != null) ctx.FolderLock = new FolderLock(ctx.FolderLock.Folder, sub);
+            OnFolderLocksChanged();
+        }
+
+        // Stay in Folder (per monitor). Toggle: any active lock -> release all;
+        // otherwise lock each monitor to the folder of what it is showing.
+        private void ToggleFolderLock()
+        {
+            if (AnyFolderLock())
+            {
+                ClearFolderLocks();
+                return;
+            }
+
+            bool sub = _folderLockIncludeSubfolders;
+            bool useIndependent = _independentMonitors && AnyMonitorSelected();
+            var globalDir = FolderLock.FolderOf(_currentMediaPath);
+            bool anySet = false;
+
+            foreach (var ctx in _monitorContexts)
+            {
+                // In sync mode every monitor shows the global pick, so they all
+                // lock to the same folder (ctx.CurrentPath is only maintained
+                // in independent mode).
+                var dir = useIndependent
+                    ? (FolderLock.FolderOf(ctx.CurrentPath) ?? globalDir)
+                    : globalDir;
+                if (dir == null) continue;
+                ctx.FolderLock = new FolderLock(dir, sub);
+                anySet = true;
+            }
+            if (globalDir != null)
+            {
+                _folderLock = new FolderLock(globalDir, sub);
+                anySet = true;
+            }
+
+            // Nothing on screen yet - nothing to lock to.
+            if (!anySet) return;
+            OnFolderLocksChanged();
+        }
+
+        // Stay in Focused Folder (all monitors). Anchors on the fullscreen
+        // window that currently has focus; falls back to the main window's
+        // current file (which, in independent mode, mirrors the first selected
+        // monitor). Pressing it again while everything is already locked to
+        // that folder releases.
+        private void LockAllToFocusedFolder()
+        {
+            bool useIndependent = _independentMonitors && AnyMonitorSelected();
+            string? anchor = null;
+            if (useIndependent)
+            {
+                var focused = _monitorContexts.FirstOrDefault(c => c.Window != null && c.Window.IsActive);
+                anchor = focused?.CurrentPath;
+            }
+            anchor ??= _currentMediaPath;
+
+            var dir = FolderLock.FolderOf(anchor);
+            if (dir == null) return;
+
+            bool sub = _folderLockIncludeSubfolders;
+            var target = new FolderLock(dir, sub);
+            if (AnyFolderLock() && ActiveFolderLocks().All(l => l.SameScopeAs(target)))
+            {
+                ClearFolderLocks();
+                return;
+            }
+
+            _folderLock = target;
+            foreach (var ctx in _monitorContexts)
+                ctx.FolderLock = new FolderLock(dir, sub);
+            OnFolderLocksChanged();
+        }
+
+        private bool AnyFolderLock() =>
+            _folderLock != null || _monitorContexts.Any(c => c.FolderLock != null);
+
+        private IEnumerable<FolderLock> ActiveFolderLocks()
+        {
+            if (_folderLock != null) yield return _folderLock;
+            foreach (var c in _monitorContexts)
+                if (c.FolderLock != null) yield return c.FolderLock;
+        }
+
+        private void ClearFolderLocks()
+        {
+            _folderLock = null;
+            foreach (var ctx in _monitorContexts) ctx.FolderLock = null;
+            OnFolderLocksChanged();
+        }
+
+        // Any pending pick was drawn under the old scope; discard and redo.
+        private void OnFolderLocksChanged()
+        {
+            InvalidatePreloads();
+            UpdateFolderLockStatus();
+        }
+
+        // Header indicator: the locked folder's name when every relevant lock
+        // agrees, otherwise "Per-monitor folders". Tooltip carries full paths.
+        private void UpdateFolderLockStatus()
+        {
+            if (FolderLockStatusText == null) return;
+
+            var locks = ActiveFolderLocks().ToList();
+            if (locks.Count == 0)
+            {
+                FolderLockStatusText.Text = "";
+                FolderLockStatusText.ToolTip = null;
+                return;
+            }
+
+            bool useIndependent = _independentMonitors && AnyMonitorSelected();
+            var perMonitor = _monitorContexts
+                .Where(c => c.Selected && c.FolderLock != null)
+                .ToList();
+            var shown = useIndependent && perMonitor.Count > 0
+                ? perMonitor.Select(c => c.FolderLock!).ToList()
+                : locks;
+
+            string suffix = _folderLockIncludeSubfolders ? " (+subfolders)" : "";
+            var folders = shown.Select(l => l.Folder).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (folders.Count == 1)
+            {
+                string name = Path.GetFileName(folders[0]);
+                if (string.IsNullOrEmpty(name)) name = folders[0];
+                FolderLockStatusText.Text = $"📁 {name}{suffix}";
+                FolderLockStatusText.ToolTip = $"Stay in folder: {folders[0]}";
+            }
+            else
+            {
+                FolderLockStatusText.Text = $"📁 Per-monitor folders{suffix}";
+                FolderLockStatusText.ToolTip = string.Join("\n",
+                    perMonitor.Select(c => $"{c.Screen.DeviceName}: {c.FolderLock!.Folder}"));
             }
         }
 
@@ -896,7 +1208,13 @@ namespace RandomMediaPlayer
                 ctx.NextPath = null;
                 ctx.NextImage = null;
             }
-            if (_mediaFiles.Count > 0) StartPreload();
+            if (_mediaFiles.Count == 0) return;
+            StartPreload();
+            // Independent mode draws per monitor; re-queue those too so the
+            // next tick doesn't have to pick inline.
+            if (_independentMonitors)
+                foreach (var ctx in _monitorContexts.Where(c => c.Selected && c.Window != null))
+                    _ = StartContextPreload(ctx);
         }
 
         private void AlwaysOnTopCheckBox_Changed(object sender, RoutedEventArgs e)
@@ -1953,11 +2271,15 @@ namespace RandomMediaPlayer
         // Worker-thread random pick. Cheap header probe first; the full
         // (downscaled, rotated) decode only happens for the one candidate that
         // passes every filter.
-        private Task<(string? path, BitmapSource? image)> PickRandomMediaAsync(PickFilter filter)
+        private Task<(string? path, BitmapSource? image)> PickRandomMediaAsync(PickFilter filter,
+                                                                               FolderLock? folderLock)
         {
-            var files = _mediaFiles; // immutable snapshot
+            var all = _mediaFiles; // immutable snapshot
             return Task.Run<(string?, BitmapSource?)>(() =>
             {
+                // A stay-in-folder lock narrows the draw to that folder's files
+                // (filtered once per scan, then cached).
+                var files = folderLock?.Filter(all) ?? all;
                 if (files.Count == 0) return (null, null);
                 var rng = Random.Shared; // thread-safe, unlike a shared System.Random
 
@@ -2025,7 +2347,7 @@ namespace RandomMediaPlayer
                 {
                     int generation = _filterGeneration;
                     var filter = BuildPickFilter(_orientationFilter, null);
-                    (path, image) = await PickRandomMediaAsync(filter);
+                    (path, image) = await PickRandomMediaAsync(filter, _folderLock);
                     // Filters / file list changed while we were picking: the
                     // result no longer reflects what the user asked for. Redo.
                     if (generation == _filterGeneration) break;
@@ -2080,7 +2402,7 @@ namespace RandomMediaPlayer
                 {
                     int generation = _filterGeneration;
                     var filter = BuildPickFilter(ctx.OrientationFilter, ctx);
-                    (path, image) = await PickRandomMediaAsync(filter);
+                    (path, image) = await PickRandomMediaAsync(filter, ctx.FolderLock);
                     if (generation == _filterGeneration) break; // stale, redo
                 }
                 ctx.NextPath = path;
@@ -2111,8 +2433,9 @@ namespace RandomMediaPlayer
         private void ReportNoCandidates()
         {
             if (_mediaFiles.Count == 0) return;
-            ProgressLabel.Content =
-                $"No file out of {_mediaFiles.Count} passed the active filters (min size / orientation / never upscale). Loosen a filter.";
+            ProgressLabel.Content = AnyFolderLock()
+                ? $"No file out of {_mediaFiles.Count} passed the active filters (stay-in-folder lock / min size / orientation / never upscale). Release the folder lock or loosen a filter."
+                : $"No file out of {_mediaFiles.Count} passed the active filters (min size / orientation / never upscale). Loosen a filter.";
         }
 
         // ---------- Image loading ----------
@@ -2621,6 +2944,25 @@ namespace RandomMediaPlayer
             HoldCtrlCheckBox.IsChecked = s.HoldCtrl;
             HoldAltCheckBox.IsChecked = s.HoldAlt;
 
+            // Stay-in-folder hotkeys
+            if (Enum.TryParse<Key>(s.FolderLockKey, out var folderLockKey))
+            {
+                _folderLockKey = folderLockKey;
+                FolderLockKeyComboBox.SelectedItem = folderLockKey.ToString();
+            }
+            FolderLockCtrlCheckBox.IsChecked = s.FolderLockCtrl;
+            FolderLockAltCheckBox.IsChecked = s.FolderLockAlt;
+            FolderLockIncludeSubfoldersCheckBox.IsChecked = s.FolderLockIncludeSubfolders;
+            _folderLockIncludeSubfolders = s.FolderLockIncludeSubfolders;
+
+            if (Enum.TryParse<Key>(s.FocusFolderLockKey, out var focusFolderLockKey))
+            {
+                _focusFolderLockKey = focusFolderLockKey;
+                FocusFolderLockKeyComboBox.SelectedItem = focusFolderLockKey.ToString();
+            }
+            FocusFolderLockCtrlCheckBox.IsChecked = s.FocusFolderLockCtrl;
+            FocusFolderLockAltCheckBox.IsChecked = s.FocusFolderLockAlt;
+
             MultiInstanceCheckBox.IsChecked = s.MultiInstanceHotkeys;
             _useLowLevelHook = s.MultiInstanceHotkeys;
 
@@ -2667,6 +3009,13 @@ namespace RandomMediaPlayer
                     HoldKey = _holdKey.ToString(),
                     HoldCtrl = HoldCtrlCheckBox.IsChecked == true,
                     HoldAlt = HoldAltCheckBox.IsChecked == true,
+                    FolderLockKey = _folderLockKey.ToString(),
+                    FolderLockCtrl = FolderLockCtrlCheckBox.IsChecked == true,
+                    FolderLockAlt = FolderLockAltCheckBox.IsChecked == true,
+                    FolderLockIncludeSubfolders = _folderLockIncludeSubfolders,
+                    FocusFolderLockKey = _focusFolderLockKey.ToString(),
+                    FocusFolderLockCtrl = FocusFolderLockCtrlCheckBox.IsChecked == true,
+                    FocusFolderLockAlt = FocusFolderLockAltCheckBox.IsChecked == true,
                     MultiInstanceHotkeys = _useLowLevelHook,
                     PersistFolders = PersistFoldersCheckBox.IsChecked == true,
                     Folders = PersistFoldersCheckBox.IsChecked == true

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -59,6 +59,21 @@ namespace RandomMediaPlayer
         public string HoldKey { get; set; } = "F9";
         public bool HoldCtrl { get; set; }
         public bool HoldAlt { get; set; }
+
+        // Stay-in-folder hotkey (global). Toggles a per-monitor folder lock:
+        // each monitor keeps picking from the folder of the file it is showing.
+        public string FolderLockKey { get; set; } = "F8";
+        public bool FolderLockCtrl { get; set; }
+        public bool FolderLockAlt { get; set; }
+        // When true, a folder lock also admits files in subfolders of the
+        // locked folder.
+        public bool FolderLockIncludeSubfolders { get; set; }
+
+        // Stay-in-focused-folder hotkey (global). Locks every monitor to the
+        // folder of the file shown on the focused monitor.
+        public string FocusFolderLockKey { get; set; } = "F7";
+        public bool FocusFolderLockCtrl { get; set; }
+        public bool FocusFolderLockAlt { get; set; }
 
         // When true, hotkeys are observed via low-level keyboard hook so
         // multiple app instances can all respond. False = exclusive

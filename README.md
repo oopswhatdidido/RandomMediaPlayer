@@ -58,8 +58,13 @@ While the slideshow is running, `SetThreadExecutionState` keeps the system + dis
 |---|---|---|
 | **Panic** | `F11` | Configurable action — Stop slideshow or Exit application. |
 | **Hold** | `F9` | Pauses the slideshow timer. Photo/GIF stays put; video loops on its current clip. Press again to release. |
+| **Stay in Folder** | `F8` | Toggle. Every monitor keeps picking from the folder of the file it is showing right now: its own folder in independent mode, the shared one in sync mode. Press again to release. |
+| **Stay in Focused Folder** | `F7` | Locks every monitor to the folder of the file shown on the focused fullscreen window (or the main window's current file). Press again on that same folder to release. |
 
-Both keys support optional **Ctrl** and **Alt** modifiers to avoid conflicts.
+All keys support optional **Ctrl** and **Alt** modifiers to avoid conflicts. F7 and F8 were chosen as defaults because Windows and most apps leave them unused.
+
+#### Folder locks
+The two stay-in-folder keys narrow the random draw without rescanning: the pick simply skips files outside the locked folder. **Include subfolders** (checkbox next to the Stay in Folder combo) makes a lock also admit files beneath the locked folder; toggling it while a lock is active applies immediately. Either key releases a lock set by the other. Locks survive stop / start and rescans, and the header shows `📁 <folder>` (or `📁 Per-monitor folders`) while one is active. If a locked folder has no file that passes the other filters, the progress label says so until the lock is released.
 
 The status indicator next to each combo says `✓ Active` (green) when the hotkey was registered successfully or `⚠ Unavailable` (orange) when something else has already claimed the combo system-wide. Common culprits: NVIDIA ShadowPlay / GeForce Experience, capture/streaming tools, hardware-vendor drivers.
 
@@ -93,6 +98,8 @@ What's saved:
 - Selected monitor (matched by device name; falls back to None if the saved monitor disappears)
 - Panic combo (key + modifiers + action)
 - Hold combo (key + modifiers)
+- Stay in Folder combo (key + modifiers) and the include-subfolders flag
+- Stay in Focused Folder combo (key + modifiers)
 - Multi-instance hotkeys flag
 - Persist folders flag
 - Folder list (only if Persist folders is on)
@@ -138,6 +145,8 @@ RandomMediaPlayer/
     ├── MainWindow.xaml(.cs)             — main UI, all hotkey infrastructure, settings load/save
     ├── FullscreenSlideshowWindow.xaml(.cs) — secondary window for fullscreen playback
     ├── AppSettings.cs                   — JSON-serialized user preferences
+    ├── MonitorContext.cs                — per-monitor config + runtime playback state
+    ├── FolderLock.cs                    — stay-in-folder scope for the random pick
     ├── AssemblyInfo.cs
     └── RandomMediaPlayer.csproj
 ```
